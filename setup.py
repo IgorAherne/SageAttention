@@ -38,7 +38,8 @@ NVCC_FLAGS_COMMON = [
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "--use_fast_math",
-    f"--threads={os.cpu_count()}",
+    # Spellcast3D round J: NVCC_THREADS caps nvcc's parallel -gencode compiles (default: as before)
+    f"--threads={os.getenv('NVCC_THREADS', os.cpu_count())}",
     # "-Xptxas=-v",
     "-diag-suppress=174", # suppress the specific warning
     "-diag-suppress=177",
@@ -129,6 +130,17 @@ def get_nvcc_flags(allowed_capabilities):
     NVCC_FLAGS += NVCC_FLAGS_COMMON
     return NVCC_FLAGS
 
+def sm80_ptx_flags():
+    """Spellcast3D round J: with SAGEATTENTION_SM80_PTX=1, PTX of _qattn_sm80's newest SASS target (8.9, else 8.6,
+    else 8.0) for the cards after it ("+PTX" in TORCH_CUDA_ARCH_LIST would drop 8.9 from the other extensions)."""
+    if os.getenv("SAGEATTENTION_SM80_PTX", "") != "1":
+        return []
+    for cap in ("8.9", "8.6", "8.0"):
+        if cap in compute_capabilities:
+            num = cap.replace(".", "")
+            return ["-gencode", f"arch=compute_{num},code=compute_{num}"]
+    return []
+
 ext_modules = []
 
 if has_capability(("8.0", "8.6")):
@@ -141,7 +153,10 @@ if has_capability(("8.0", "8.6")):
         extra_compile_args={
             "cxx": CXX_FLAGS,
             # Build binary for sm80 if sm86 is detected. No need to build binary for sm86
-            "nvcc": get_nvcc_flags(["8.0"]),
+            # Spellcast3D round J: SASS for sm86 and sm89 as well when the arch list names them (the per_warp
+            # fp16+fp32 kernel of qk_int_sv_f16_cuda_sm80.cu is faster compiled for the card), with
+            # SAGEATTENTION_SM80_PTX=1 PTX of the newest of them
+            "nvcc": get_nvcc_flags(["8.0", "8.6", "8.9"]) + sm80_ptx_flags(),
         },
         py_limited_api=True,
     )

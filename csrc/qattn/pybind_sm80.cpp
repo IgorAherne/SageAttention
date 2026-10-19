@@ -79,6 +79,20 @@ TORCH_LIBRARY(sageattention_qattn_sm80, m) {
             "float sm_scale, "
             "int return_lse"
           ") -> Tensor");
+    // Spellcast3D round J (post5): the shipped op's schema; the tuned instantiation where it exists (the same bits)
+    m.def("qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d("
+            "Tensor query, "
+            "Tensor key, "
+            "Tensor value, "
+            "Tensor(a!) output, "
+            "Tensor query_scale, "
+            "Tensor key_scale, "
+            "int tensor_layout, "
+            "int is_causal, "
+            "int qk_quant_gran, "
+            "float sm_scale, "
+            "int return_lse"
+          ") -> Tensor");
     m.def("qk_int8_sv_f16_accum_f16_fuse_v_mean_attn("
             "Tensor query, "
             "Tensor key, "
@@ -101,4 +115,5 @@ TORCH_LIBRARY_IMPL(sageattention_qattn_sm80, CUDA, m) {
     m.impl("qk_int8_sv_f16_accum_f16_attn", &qk_int8_sv_f16_accum_f16_attn);
     m.impl("qk_int8_sv_f16_accum_f16_attn_inst_buf", &qk_int8_sv_f16_accum_f16_attn_inst_buf);
     m.impl("qk_int8_sv_f16_accum_f16_fuse_v_mean_attn", &qk_int8_sv_f16_accum_f16_fuse_v_mean_attn);
+    m.impl("qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d", &qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d);
 }

@@ -41,9 +41,111 @@
 #define MMA_SV_N 16
 #define MMA_SV_K 16
 
+// ---- Spellcast3D round J (README-round-j.md): the instantiation that sageattn_qk_int8_pv_fp16_cuda(qk_quant_gran=
+// "per_warp", pv_accum_dtype="fp16+fp32") launches for head 128, not causal, no LSE, bf16 output (from
+// qk_int8_sv_f16_accum_f16_attn_inst_buf) has a twin (sc3d = true, see post5 below) compiled with two changes
+// that keep its answers bit for bit - the same
+// operations on the same values in the same order (the same arithmetic instructions in its SASS) - and make it
+// faster on sm_8x cards:
+//  - SC3D_MIN_BLOCKS 2: __launch_bounds__(256, 2): at most 128 registers a thread (64-72 bytes of spills, a 32-40
+//    byte stack), two blocks (16 warps) an SM instead of one, so one block's softmax overlaps the other's MMAs;
+//  - SC3D_SV_ORDER 1: the P.V step one 16-column tile of the output at a time (sc3d_sv_fv: the tile's four 16-key
+//    fp16 MMAs, then its fp32 add) instead of the eight tiles' fp16 buffers at once - the same MMA chains, 32 fewer
+//    live registers (2 or 4: that many tiles at a time).
+// RTX 3060, round J: -13 % a call at 21,547 tokens as sm_86 SASS, -12 % as sm_80 SASS, bit-identical on the flows'
+// captured q/k/v and on random tables. One nvcc command compiles every -gencode of this file with the same -D flags,
+// so a per-architecture choice would go through __CUDA_ARCH__ here; the same values won as sm_80 and as sm_86 SASS,
+// and sm_89 takes them too (not measured: no sm_89 card). Every other instantiation is compiled as before (no launch
+// bounds, the original P.V step). -DSC3D_MIN_BLOCKS=0 -DSC3D_SV_ORDER=0 builds the original kernel.
+// post5 (Spellcast3D round J): BOTH kernels are built. The kernel template's last parameter `sc3d` (default false)
+// selects the tuned code: every op of this file launches sc3d = false instantiations - the shipped code, as the wheel
+// post3 was built from - except the second op qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d (the schema of
+// qk_int8_sv_f16_accum_f16_attn_inst_buf), which launches the sc3d = true instantiation where sc3d_tuned names its
+// configuration and the shipped kernel for every other one: the same bits as the shipped op for every input. Which
+// of the two ops is faster depends on the card (measured -13 % a call on an RTX 3060; other cards unmeasured), so
+// the caller chooses (Pixal3D times both at its first use).
+#ifndef SC3D_MIN_BLOCKS
+#define SC3D_MIN_BLOCKS 2
+#endif
+#ifndef SC3D_SV_ORDER
+#define SC3D_SV_ORDER 1
+#endif
+
 template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN, QuantGranularity K_GRAN,
-        typename DTypeSVAccum = float, bool use_inst_buffer = false, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_mean=false>
-__global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K, half *__restrict__ V, DTypeOut *__restrict__ O, float *__restrict__ Lse,
+        typename DTypeSVAccum, bool use_inst_buffer, typename DTypeOut, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode, bool return_lse, bool fuse_v_mean, bool sc3d>
+struct sc3d_tuned
+{
+  static constexpr bool value = sc3d && CTA_Q == 128 && CTA_K == 64 && WARP_Q == 16 && WARP_K == 64 && head_dim == 128 &&
+    DTypeQK == DataType::kInt8 && Q_GRAN == QuantGranularity::kPerWarp && K_GRAN == QuantGranularity::kPerWarp &&
+    std::is_same<DTypeSVAccum, float>::value && use_inst_buffer && std::is_same<DTypeOut, nv_bfloat16>::value &&
+    DenominatorAccumUnit == ComputeUnit::kTensorCore && mask_mode == MaskMode::kNone && !return_lse && !fuse_v_mean;
+  // __launch_bounds__(0, 0) emits no directive: the other instantiations compile as without launch bounds
+  static constexpr uint32_t max_threads = (value && SC3D_MIN_BLOCKS > 0) ? 32 * (CTA_Q / WARP_Q) * (CTA_K / WARP_K) : 0;
+  static constexpr uint32_t min_blocks = (value && SC3D_MIN_BLOCKS > 0) ? SC3D_MIN_BLOCKS : 0;
+};
+
+#define SC3D_TUNED sc3d_tuned<CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK, Q_GRAN, K_GRAN, DTypeSVAccum, use_inst_buffer, DTypeOut, DenominatorAccumUnit, mask_mode, return_lse, fuse_v_mean, sc3d>
+
+// The P.V step of compute_fp16_sv_permuted_inst_buf (attn_utils.cuh) with its loops swapped: `group` output column
+// tiles (fv) at a time, each accumulating its four 16-key steps (fk) in fp16 and then added into the fp32
+// accumulator, instead of all eight fv chains at once. Every fv chain is the same chain of mma instructions on the
+// same data in the same order (fk 0 initialises, 1..3 accumulate) followed by the same fp32 adds, so the values are
+// the same; only `group` of the eight 4-register fp16 buffers are alive at a time. The shared-memory offsets are the
+// original walk in closed form (k128B swizzle, 16 x 16-byte units a row): offset(fk, fv) = ((o + (fv / 4) * 8) ^
+// (2 * (fv % 4))) + fk * 16 * stride (checked against the walk for every lane); offset_V is left as it came, as the
+// original leaves it.
+template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v, SwizzleMode swizzle_mode, uint32_t stride, uint32_t group>
+__device__ __forceinline__ void sc3d_sv_fv(const smem_t<swizzle_mode, stride> &smem_V, uint32_t RS_f16[][num_tiles_k][4], float RO[][num_tiles_v][8], const uint32_t offset_V)
+{
+  static_assert(swizzle_mode == SwizzleMode::k128B && stride == 16 && num_tiles_v == 8 && num_tiles_v % group == 0,
+                "written for head 128 fp16 V (k128B swizzle, 16 units a row)");
+#pragma unroll
+  for (uint32_t fv0 = 0; fv0 < num_tiles_v; fv0 += group)
+  {
+    uint32_t buf[group][num_tiles_q][4];
+#pragma unroll
+    for (uint32_t fk = 0; fk < num_tiles_k; fk++)
+    {
+#pragma unroll
+      for (uint32_t j = 0; j < group; j++)
+      {
+        const uint32_t fv = fv0 + j;
+        uint32_t RV[4];
+        smem_V.ldmatrix_m8n8x4_trans(((offset_V + (fv / 4) * 8) ^ (2 * (fv % 4))) + fk * 16 * stride, RV);
+#pragma unroll
+        for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+        {
+          if (fk == 0)
+            mma::mma_sync_m16n16k16_row_col_f16f16f16<mma::MMAMode::kInit>(buf[j][fq], RS_f16[fq][fk], RV);
+          else
+            mma::mma_sync_m16n16k16_row_col_f16f16f16<mma::MMAMode::kInplaceUpdate>(buf[j][fq], RS_f16[fq][fk], RV);
+        }
+      }
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < group; j++)
+    {
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+      {
+        const uint32_t fv = fv0 + j;
+        RO[fq][fv][0] += __half2float(((half2*)buf[j][fq])[0].x);
+        RO[fq][fv][1] += __half2float(((half2*)buf[j][fq])[0].y);
+        RO[fq][fv][2] += __half2float(((half2*)buf[j][fq])[1].x);
+        RO[fq][fv][3] += __half2float(((half2*)buf[j][fq])[1].y);
+        RO[fq][fv][4] += __half2float(((half2*)buf[j][fq])[2].x);
+        RO[fq][fv][5] += __half2float(((half2*)buf[j][fq])[2].y);
+        RO[fq][fv][6] += __half2float(((half2*)buf[j][fq])[3].x);
+        RO[fq][fv][7] += __half2float(((half2*)buf[j][fq])[3].y);
+      }
+    }
+  }
+}
+// ---- end of the Spellcast3D round J helpers
+
+template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN, QuantGranularity K_GRAN,
+        typename DTypeSVAccum = float, bool use_inst_buffer = false, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_mean=false, bool sc3d=false>
+__global__ void __launch_bounds__(SC3D_TUNED::max_threads, SC3D_TUNED::min_blocks) qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K, half *__restrict__ V, DTypeOut *__restrict__ O, float *__restrict__ Lse,
                       float *__restrict__ Q_scale, float *__restrict__ K_scale, DTypeOut *__restrict__ V_mean,
                       const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
                       const uint32_t stride_bz_q, const uint32_t stride_seq_q, const uint32_t stride_h_q,
@@ -341,8 +443,16 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
     }
     else
     {
-      compute_fp16_sv_permuted_inst_buf<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
-        smem_V, RS_f16, RO, d, V_smem_offset_mma); 
+      if constexpr (SC3D_TUNED::value && SC3D_SV_ORDER > 0)
+      {
+        sc3d_sv_fv<num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, SC3D_SV_ORDER>(
+          smem_V, RS_f16, RO, V_smem_offset_mma);
+      }
+      else
+      {
+        compute_fp16_sv_permuted_inst_buf<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
+          smem_V, RS_f16, RO, d, V_smem_offset_mma);
+      }
     }
 
     __syncthreads();
@@ -439,8 +549,16 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
     }
     else
     {
-      compute_fp16_sv_permuted_inst_buf<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
-        smem_V, RS_f16, RO, d, V_smem_offset_mma);
+      if constexpr (SC3D_TUNED::value && SC3D_SV_ORDER > 0)
+      {
+        sc3d_sv_fv<num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, SC3D_SV_ORDER>(
+          smem_V, RS_f16, RO, V_smem_offset_mma);
+      }
+      else
+      {
+        compute_fp16_sv_permuted_inst_buf<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
+          smem_V, RS_f16, RO, d, V_smem_offset_mma);
+      }
     }
 
     __syncthreads();
@@ -527,8 +645,16 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
     }
     else
     {
-      compute_fp16_sv_permuted_inst_buf<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
-        smem_V, RS_f16, RO, d, V_smem_offset_mma);
+      if constexpr (SC3D_TUNED::value && SC3D_SV_ORDER > 0)
+      {
+        sc3d_sv_fv<num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, SC3D_SV_ORDER>(
+          smem_V, RS_f16, RO, V_smem_offset_mma);
+      }
+      else
+      {
+        compute_fp16_sv_permuted_inst_buf<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
+          smem_V, RS_f16, RO, d, V_smem_offset_mma);
+      }
     }
 
     __syncthreads();
@@ -1020,7 +1146,9 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
   return lse;
 }
 
-torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
+// post5: the body of qk_int8_sv_f16_accum_f16_attn_inst_buf (sc3d = false) and of its _sc3d twin (sc3d = true)
+template <bool sc3d>
+static torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf_impl(torch::Tensor query,
                     torch::Tensor key,
                     torch::Tensor value,
                     torch::Tensor output,
@@ -1161,8 +1289,11 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
             //                                     smem_Q                                     smem_K                            smem_V                     smem_O
             size_t smem_max = std::max(CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(half), CTA_Q * HEAD_DIM * sizeof(half));
             
+            // post5: the _sc3d op launches the tuned instantiation where sc3d_tuned names this configuration, the
+            // shipped one (sc3d = false) everywhere else; the shipped op always the shipped one
+            constexpr bool SC3D_ON = sc3d_tuned<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), float, true, DTypeOut, ComputeUnit::kTensorCore, mask_mode, RETURN_LSE, false, sc3d>::value;
             auto kernel_func = qk_int_sv_f16_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), float, true, DTypeOut, ComputeUnit::kTensorCore, 
-                                                          mask_mode, RETURN_LSE, false>;
+                                                          mask_mode, RETURN_LSE, false, SC3D_ON>;
 
             cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
 
@@ -1193,6 +1324,39 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
   });
   
   return lse;
+}
+
+// the shipped op: the shipped kernel for every configuration (as in the wheel post3 was built from)
+torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
+                    torch::Tensor key,
+                    torch::Tensor value,
+                    torch::Tensor output,
+                    torch::Tensor query_scale,
+                    torch::Tensor key_scale,
+                    int64_t tensor_layout,
+                    int64_t is_causal,
+                    int64_t qk_quant_gran,
+                    double sm_scale,
+                    int64_t return_lse)
+{
+  return qk_int8_sv_f16_accum_f16_attn_inst_buf_impl<false>(query, key, value, output, query_scale, key_scale, tensor_layout, is_causal, qk_quant_gran, sm_scale, return_lse);
+}
+
+// post5 (Spellcast3D round J): the same op with the tuned instantiation for head 128 / not causal / per_warp / no
+// LSE / bf16 out (the same bits; faster on some cards, see the note at the top) and the shipped kernel otherwise
+torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d(torch::Tensor query,
+                    torch::Tensor key,
+                    torch::Tensor value,
+                    torch::Tensor output,
+                    torch::Tensor query_scale,
+                    torch::Tensor key_scale,
+                    int64_t tensor_layout,
+                    int64_t is_causal,
+                    int64_t qk_quant_gran,
+                    double sm_scale,
+                    int64_t return_lse)
+{
+  return qk_int8_sv_f16_accum_f16_attn_inst_buf_impl<true>(query, key, value, output, query_scale, key_scale, tensor_layout, is_causal, qk_quant_gran, sm_scale, return_lse);
 }
 
 torch::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(torch::Tensor query,
