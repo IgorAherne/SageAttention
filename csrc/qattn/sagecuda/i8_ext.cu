@@ -1,5 +1,5 @@
 // Spellcast3D round K: the int8 P.V kernel and the v quantiser of qk_int_sv_i8_cuda_sm80.cu (the package source
-// itself, its knobs I8_* as -D flags) as a standalone torch extension, for the checks and timings of
+// itself; I8_STUDY as a -D flag) as a standalone torch extension, for the checks and timings of
 // code/devtools/pixal3d-lowmem/round-k/int8pv/kernel in the Spellcast3D hub.
 //
 //   module.attn(q_int8, k_int8, v_t_int8, out, q_scale, k_scale, v_scale, v_mean, tensor_layout, is_causal,
@@ -14,8 +14,6 @@
 pybind11::dict info()
 {
   pybind11::dict d;
-  d["I8_MIN_BLOCKS"] = I8_MIN_BLOCKS;
-  d["I8_I2F_MAGIC"] = I8_I2F_MAGIC;
   d["I8_STUDY"] = I8_STUDY;
   d["threads"] = (int)sc3d_i8::THREADS;
   d["smem_bytes"] = (int)sc3d_i8::SMEM_BYTES;
