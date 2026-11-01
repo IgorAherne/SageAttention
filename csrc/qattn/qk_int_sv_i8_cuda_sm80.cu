@@ -53,6 +53,27 @@
 #ifndef I8_STUDY
 #define I8_STUDY 0
 #endif
+// study: t > 0 keeps the accumulators relative to the last block's reference a = max(m_blk, m - t) (RO = Y * exp2(a -
+// m) / 255), so a block adds product * v_scale without the row factor; P relative to a (= m_blk unless the block lies
+// more than t below the running maximum)
+#ifndef I8_ANCHOR
+#define I8_ANCHOR 0
+#endif
+// the loads: 0 the fp16 kernel's pipeline (one K and one V buffer, four barriers a block); 1 two K buffers, V(j) loaded
+// at the start of block j (two barriers a block); 2 two K and two V buffers, block j + 1 loaded during block j (one);
+// 3 as 2, warps 4-7 half a block behind warps 0-3 (round J's ping-pong, sv_kernel_pp.cuh)
+#ifndef I8_PIPE
+#define I8_PIPE 0
+#endif
+// 1: the accumulators' rescale skipped when no row of the warp has a new maximum (o_scale = exp2(0) = 1: the same bits);
+// 2: the same, the rescale done in the P.V step (RO = fma(product, factor, RO * o_scale), a warp-uniform choice per block)
+#ifndef I8_SKIP
+#define I8_SKIP 0
+#endif
+// output tiles of the P.V step in flight together (1 or 2)
+#ifndef I8_SV_GROUP
+#define I8_SV_GROUP 1
+#endif
 
 namespace sc3d_i8 {
 
@@ -66,11 +87,16 @@ constexpr uint32_t TILES_K = CTA_K / 16;         // 16-key tiles of S per warp
 constexpr uint32_t TILES_QK_INNER = HEAD / 32;   // k32 steps of Q.K^T
 constexpr uint32_t TILES_V = HEAD / 16;          // 16-channel tiles of O
 
-// Q int8 [128][128], K int8 [64][128], V^T int8 [128][64], the block's v scales fp32 [128]; O bf16 [128][128] at the end
-constexpr uint32_t SMEM_V_OFFSET = (CTA_Q + CTA_K) * HEAD;
-constexpr uint32_t SMEM_VS_OFFSET = SMEM_V_OFFSET + HEAD * CTA_K;
-constexpr size_t SMEM_BYTES = (SMEM_VS_OFFSET + HEAD * sizeof(float)) > (CTA_Q * HEAD * sizeof(nv_bfloat16))
-                              ? (SMEM_VS_OFFSET + HEAD * sizeof(float)) : (CTA_Q * HEAD * sizeof(nv_bfloat16));
+// Q int8 [128][128], K int8 [64][128] (x K_BUFS), V^T int8 [128][64] (x V_BUFS), the block's v scales fp32 [128]
+// (x V_BUFS); O bf16 [128][128] at the end
+constexpr uint32_t K_BUFS = (I8_PIPE >= 1) ? 2 : 1;
+constexpr uint32_t V_BUFS = (I8_PIPE >= 2) ? 2 : 1;
+constexpr uint32_t K_BUF_UNITS = CTA_K * HEAD / 16;    // one tile in 16-byte units: 64 rows of K, 128 rows of V^T
+constexpr uint32_t V_BUF_UNITS = HEAD * CTA_K / 16;
+constexpr uint32_t SMEM_V_OFFSET = (CTA_Q + K_BUFS * CTA_K) * HEAD;
+constexpr uint32_t SMEM_VS_OFFSET = SMEM_V_OFFSET + V_BUFS * HEAD * CTA_K;
+constexpr size_t SMEM_BYTES = (SMEM_VS_OFFSET + V_BUFS * HEAD * sizeof(float)) > (CTA_Q * HEAD * sizeof(nv_bfloat16))
+                              ? (SMEM_VS_OFFSET + V_BUFS * HEAD * sizeof(float)) : (CTA_Q * HEAD * sizeof(nv_bfloat16));
 
 __device__ __forceinline__ float i2f(int32_t x)
 {
@@ -95,8 +121,10 @@ __device__ __forceinline__ uint32_t pack_u8x4(float a, float b, float c, float e
 // update_mdo (attn_utils.cuh, float accumulators) for the int8 P.V: m, d and RO rescaled as there; P raised relative
 // to the block's maximum m_blk instead of m; pmax = exp2(m_blk - m) per row; d gains pmax times this thread's part of
 // the block's row sum of the fp32 P (the lanes' parts are summed by normalize_d<kCudaCore>)
-__device__ __forceinline__ void update_mdo_blk(float RS[][TILES_K][8], float RO[][TILES_V][8], float m[][2], float d[][2], float pmax[2], const float &sm_scale)
+__device__ __forceinline__ void update_mdo_blk(float RS[][TILES_K][8], float RO[][TILES_V][8], float m[][2], float d[][2], float pmax[2], float anchor[2], float y_out[2], bool &y_any, const float &sm_scale)
 {
+  float y_scale[2];
+  bool new_max = false;
 #pragma unroll
   for (uint32_t k = 0; k < 2; k++)
   {
@@ -114,19 +142,20 @@ __device__ __forceinline__ void update_mdo_blk(float RS[][TILES_K][8], float RO[
     m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x2));
 
     m[0][k] = max(m[0][k], m_temp);
+    new_max |= (m[0][k] != m_prev);
     float o_scale = math::ptx_exp2(m_prev - m[0][k]);
     d[0][k] *= o_scale;
-#pragma unroll
-    for (uint32_t fv = 0; fv < TILES_V; fv++)
-    {
-      RO[0][fv][k * 2 + 0] *= o_scale;
-      RO[0][fv][k * 2 + 1] *= o_scale;
-      RO[0][fv][k * 2 + 4] *= o_scale;
-      RO[0][fv][k * 2 + 5] *= o_scale;
-    }
+#if I8_ANCHOR
+    const float a_new = max(m_temp, m[0][k] - (float)I8_ANCHOR);
+    y_scale[k] = math::ptx_exp2(anchor[k] - a_new);
+    anchor[k] = a_new;
+#else
+    const float a_new = m_temp;
+    y_scale[k] = o_scale;
+#endif
 
-    pmax[k] = math::ptx_exp2(m_temp - m[0][k]);
-    float negative_m = -m_temp;
+    pmax[k] = math::ptx_exp2(a_new - m[0][k]);
+    float negative_m = -a_new;
     float rowsum = 0.0f;
 #pragma unroll
     for (uint32_t fk = 0; fk < TILES_K; fk++)
@@ -138,6 +167,28 @@ __device__ __forceinline__ void update_mdo_blk(float RS[][TILES_K][8], float RO[
       rowsum += RS[0][fk][k * 2 + 0] + RS[0][fk][k * 2 + 1] + RS[0][fk][k * 2 + 4] + RS[0][fk][k * 2 + 5];
     }
     d[0][k] = fmaf(pmax[k], rowsum, d[0][k]);
+  }
+#if I8_SKIP == 2 && !I8_ANCHOR
+  y_out[0] = y_scale[0];
+  y_out[1] = y_scale[1];
+  y_any = __any_sync(0xffffffff, new_max);
+  if (false)
+#elif I8_SKIP && !I8_ANCHOR
+  if (__any_sync(0xffffffff, new_max))
+#endif
+  {
+#pragma unroll
+    for (uint32_t k = 0; k < 2; k++)
+    {
+#pragma unroll
+      for (uint32_t fv = 0; fv < TILES_V; fv++)
+      {
+        RO[0][fv][k * 2 + 0] *= y_scale[k];
+        RO[0][fv][k * 2 + 1] *= y_scale[k];
+        RO[0][fv][k * 2 + 4] *= y_scale[k];
+        RO[0][fv][k * 2 + 5] *= y_scale[k];
+      }
+    }
   }
 }
 
@@ -158,46 +209,79 @@ __device__ __forceinline__ void pack_p(float RS[][TILES_K][8], uint32_t RP[2][4]
 
 // P.V of one block: per 16-channel tile, the int32 product over the 64 keys (V^T fragments by ldmatrix, two
 // m16n16k32 u8 x s8), then RO += product * (pmax / 255) * v_scale per row and channel
-__device__ __forceinline__ void compute_sv(const smem_t<SwizzleMode::k64B, 4> &smem_V, const float *smem_VS, uint32_t RP[2][4],
-                                           float RO[][TILES_V][8], const float pmax[2], const uint32_t offset_V0, const uint32_t offset_V1)
+template <bool kRescale>
+__device__ __forceinline__ void compute_sv_t(const smem_t<SwizzleMode::k64B, 4> &smem_V, const float *smem_VS, uint32_t RP[2][4],
+                                             float RO[][TILES_V][8], const float pmax[2], const uint32_t offset_V0, const uint32_t offset_V1,
+                                             const float y_sc[2])
 {
+#if I8_ANCHOR
+  const float f0 = 1.0f, f1 = 1.0f;
+#else
   const float f0 = pmax[0] * (1.0f / 255.0f);
   const float f1 = pmax[1] * (1.0f / 255.0f);
+#endif
   const float *vs = smem_VS + 2 * (get_lane_id() % 4);
 #pragma unroll
-  for (uint32_t fv = 0; fv < TILES_V; fv++)
+  for (uint32_t fv0 = 0; fv0 < TILES_V; fv0 += I8_SV_GROUP)
   {
-    int32_t acc[8];
+    int32_t acc[I8_SV_GROUP][8];
 #if I8_STUDY & 1
 #pragma unroll
-    for (uint32_t i = 0; i < 8; i++)
-      acc[i] = (int32_t)(RP[i / 4][i % 4] ^ fv);
+    for (uint32_t j = 0; j < I8_SV_GROUP; j++)
+#pragma unroll
+      for (uint32_t i = 0; i < 8; i++)
+        acc[j][i] = (int32_t)(RP[i / 4][i % 4] ^ (fv0 + j));
 #else
-    uint32_t RV[4];
+    uint32_t RV[I8_SV_GROUP][4];
     // rows: channels fv * 16 + (lane % 8) + 8 * (lane / 16), 16-byte units: keys 0-15 / 16-31 (+ 32 for the second step)
-    smem_V.ldmatrix_m8n8x4(offset_V0 + fv * 16 * 4, RV);
-    mma::mma_sync_m16n16k32_row_col_u8s8s32<mma::MMAMode::kInit>(acc, RP[0], RV);
-    smem_V.ldmatrix_m8n8x4(offset_V1 + fv * 16 * 4, RV);
-    mma::mma_sync_m16n16k32_row_col_u8s8s32<mma::MMAMode::kInplaceUpdate>(acc, RP[1], RV);
+#pragma unroll
+    for (uint32_t j = 0; j < I8_SV_GROUP; j++)
+      smem_V.ldmatrix_m8n8x4(offset_V0 + (fv0 + j) * 16 * 4, RV[j]);
+#pragma unroll
+    for (uint32_t j = 0; j < I8_SV_GROUP; j++)
+      mma::mma_sync_m16n16k32_row_col_u8s8s32<mma::MMAMode::kInit>(acc[j], RP[0], RV[j]);
+#pragma unroll
+    for (uint32_t j = 0; j < I8_SV_GROUP; j++)
+      smem_V.ldmatrix_m8n8x4(offset_V1 + (fv0 + j) * 16 * 4, RV[j]);
+#pragma unroll
+    for (uint32_t j = 0; j < I8_SV_GROUP; j++)
+      mma::mma_sync_m16n16k32_row_col_u8s8s32<mma::MMAMode::kInplaceUpdate>(acc[j], RP[1], RV[j]);
 #endif
+#pragma unroll
+    for (uint32_t j = 0; j < I8_SV_GROUP; j++)
+    {
+      const uint32_t fv = fv0 + j;
 #if I8_STUDY & 2
 #pragma unroll
-    for (uint32_t i = 0; i < 8; i++)
-      RO[0][fv][i] += __int_as_float(acc[i]);
+      for (uint32_t i = 0; i < 8; i++)
+        RO[0][fv][i] += __int_as_float(acc[j][i]);
 #else
-    // accumulator elements 0, 1 / 4, 5: row g, channels fv * 16 + 2 (lane % 4) + 0, 1 / + 8; 2, 3 / 6, 7: row g + 8
-    const float2 sa = *(const float2*)(vs + fv * 16);
-    const float2 sb = *(const float2*)(vs + fv * 16 + 8);
-    RO[0][fv][0] = fmaf(i2f(acc[0]), f0 * sa.x, RO[0][fv][0]);
-    RO[0][fv][1] = fmaf(i2f(acc[1]), f0 * sa.y, RO[0][fv][1]);
-    RO[0][fv][2] = fmaf(i2f(acc[2]), f1 * sa.x, RO[0][fv][2]);
-    RO[0][fv][3] = fmaf(i2f(acc[3]), f1 * sa.y, RO[0][fv][3]);
-    RO[0][fv][4] = fmaf(i2f(acc[4]), f0 * sb.x, RO[0][fv][4]);
-    RO[0][fv][5] = fmaf(i2f(acc[5]), f0 * sb.y, RO[0][fv][5]);
-    RO[0][fv][6] = fmaf(i2f(acc[6]), f1 * sb.x, RO[0][fv][6]);
-    RO[0][fv][7] = fmaf(i2f(acc[7]), f1 * sb.y, RO[0][fv][7]);
+      // accumulator elements 0, 1 / 4, 5: row g, channels fv * 16 + 2 (lane % 4) + 0, 1 / + 8; 2, 3 / 6, 7: row g + 8
+      const float2 sa = *(const float2*)(vs + fv * 16);
+      const float2 sb = *(const float2*)(vs + fv * 16 + 8);
+      RO[0][fv][0] = fmaf(i2f(acc[j][0]), f0 * sa.x, kRescale ? RO[0][fv][0] * y_sc[0] : RO[0][fv][0]);
+      RO[0][fv][1] = fmaf(i2f(acc[j][1]), f0 * sa.y, kRescale ? RO[0][fv][1] * y_sc[0] : RO[0][fv][1]);
+      RO[0][fv][2] = fmaf(i2f(acc[j][2]), f1 * sa.x, kRescale ? RO[0][fv][2] * y_sc[1] : RO[0][fv][2]);
+      RO[0][fv][3] = fmaf(i2f(acc[j][3]), f1 * sa.y, kRescale ? RO[0][fv][3] * y_sc[1] : RO[0][fv][3]);
+      RO[0][fv][4] = fmaf(i2f(acc[j][4]), f0 * sb.x, kRescale ? RO[0][fv][4] * y_sc[0] : RO[0][fv][4]);
+      RO[0][fv][5] = fmaf(i2f(acc[j][5]), f0 * sb.y, kRescale ? RO[0][fv][5] * y_sc[0] : RO[0][fv][5]);
+      RO[0][fv][6] = fmaf(i2f(acc[j][6]), f1 * sb.x, kRescale ? RO[0][fv][6] * y_sc[1] : RO[0][fv][6]);
+      RO[0][fv][7] = fmaf(i2f(acc[j][7]), f1 * sb.y, kRescale ? RO[0][fv][7] * y_sc[1] : RO[0][fv][7]);
 #endif
+    }
   }
+}
+
+__device__ __forceinline__ void compute_sv(const smem_t<SwizzleMode::k64B, 4> &smem_V, const float *smem_VS, uint32_t RP[2][4],
+                                           float RO[][TILES_V][8], const float pmax[2], const uint32_t offset_V0, const uint32_t offset_V1,
+                                           const float y_sc[2], const bool y_any)
+{
+#if I8_SKIP == 2 && !I8_ANCHOR
+  if (y_any)
+    compute_sv_t<true>(smem_V, smem_VS, RP, RO, pmax, offset_V0, offset_V1, y_sc);
+  else
+#endif
+    compute_sv_t<false>(smem_V, smem_VS, RP, RO, pmax, offset_V0, offset_V1, y_sc);
 }
 
 // One block of 64 keys: kStep 0 the main loop (S unscaled, sm_scale * dequant; the next K without predicate),
@@ -225,7 +309,7 @@ __device__ __forceinline__ void compute_sv(const smem_t<SwizzleMode::k64B, 4> &s
       apply_out_of_bound_mask<1, TILES_K>(K_idx_lane_base, RS_f32, kv_len);                                              \
     K_idx_lane_base += CTA_K;                                                                                            \
     float pmax[2];                                                                                                       \
-    update_mdo_blk(RS_f32, RO, m, d, pmax, (kStep == 0) ? sm_scale : original_sm_scale);                                \
+    update_mdo_blk(RS_f32, RO, m, d, pmax, anchor, y_sc, y_any, (kStep == 0) ? sm_scale : original_sm_scale);                        \
     uint32_t RP[2][4];                                                                                                   \
     pack_p(RS_f32, RP);                                                                                                  \
     if constexpr (kStep < 2)                                                                                             \
@@ -248,14 +332,80 @@ __device__ __forceinline__ void compute_sv(const smem_t<SwizzleMode::k64B, 4> &s
       cp_async::wait_group<0>();                                                                                         \
       __syncthreads();                                                                                                   \
     }                                                                                                                    \
-    compute_sv(smem_V, smem_VS, RP, RO, pmax, V_smem_offset_mma0, V_smem_offset_mma1);                                   \
+    compute_sv(smem_V, smem_VS, RP, RO, pmax, V_smem_offset_mma0, V_smem_offset_mma1, y_sc, y_any);                                   \
     __syncthreads();                                                                                                     \
     if constexpr (kStep < 2)                                                                                             \
     {                                                                                                                    \
-      load_v();                                                                                                          \
+      load_v(0);                                                                                                         \
       cp_async::commit_group();                                                                                          \
       K_load_idx_lane_base += CTA_K;                                                                                     \
     }                                                                                                                    \
+  }
+
+// The same block with I8_PIPE 1 / 2 (block index blk): one barrier when K(blk) (and V(blk)) have arrived, which also
+// frees the other buffers; then the next loads, Q.K^T, the softmax, (I8_PIPE 1: V(blk) arrived, a barrier) and P.V
+#define SC3D_I8_STEP_P(kStep)                                                                                            \
+  {                                                                                                                      \
+    const uint32_t kb = blk & 1;                                                                                         \
+    cp_async::wait_group<0>();                                                                                           \
+    __syncthreads();                                                                                                     \
+    if constexpr (I8_PIPE == 1)                                                                                          \
+      load_v(0);                                                                                                         \
+    if constexpr (kStep < 2)                                                                                             \
+    {                                                                                                                    \
+      if constexpr (I8_PIPE == 1)                                                                                        \
+        cp_async::commit_group();                                                                                        \
+      uint32_t k_off = K_smem_offset_load + (kb ^ 1) * K_BUF_UNITS;                                                      \
+      if constexpr (kStep == 0)                                                                                          \
+        load_global_to_share<8, 4, 1, CTA_K / (NUM_WARPS * 4), SwizzleMode::k128B, HEAD / 16, CTA_K>(                    \
+          &K_lane_base_ptr, k_off, stride_seq_k, smem_K);                                                                \
+      else                                                                                                               \
+        load_global_to_share<8, 4, 1, CTA_K / (NUM_WARPS * 4), SwizzleMode::k128B, HEAD / 16, CTA_K>(                    \
+          &K_lane_base_ptr, k_off, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);                                  \
+      K_load_idx_lane_base += CTA_K;                                                                                     \
+      if constexpr (I8_PIPE >= 2)                                                                                        \
+        load_v(kb ^ 1);                                                                                                  \
+    }                                                                                                                    \
+    cp_async::commit_group();                                                                                            \
+    uint32_t k_mma = K_smem_offset_mma + kb * K_BUF_UNITS;                                                               \
+    compute_int_qk<NUM_WARPS, 1, 1, TILES_K, TILES_QK_INNER, SwizzleMode::k128B, HEAD / 16, DataType::kInt8>(           \
+      smem_Q, smem_K, RS, Q_smem_offset_mma, k_mma);                                                                     \
+    float RS_f32[1][TILES_K][8];                                                                                         \
+    _Pragma("unroll")                                                                                                    \
+    for (uint32_t fk = 0; fk < TILES_K; fk++)                                                                            \
+    {                                                                                                                    \
+      _Pragma("unroll")                                                                                                  \
+      for (uint32_t k = 0; k < 8; k++)                                                                                   \
+      {                                                                                                                  \
+        if constexpr (kStep == 0)                                                                                        \
+          RS_f32[0][fk][k] = __int2float_rz(RS[0][fk][k]);                                                               \
+        else                                                                                                             \
+          RS_f32[0][fk][k] = __int2float_rz(RS[0][fk][k]) * dequant_scale;                                               \
+      }                                                                                                                  \
+    }                                                                                                                    \
+    if constexpr (kStep == 2)                                                                                            \
+      apply_out_of_bound_mask<1, TILES_K>(K_idx_lane_base, RS_f32, kv_len);                                              \
+    K_idx_lane_base += CTA_K;                                                                                            \
+    float pmax[2];                                                                                                       \
+    update_mdo_blk(RS_f32, RO, m, d, pmax, anchor, y_sc, y_any, (kStep == 0) ? sm_scale : original_sm_scale);                        \
+    uint32_t RP[2][4];                                                                                                   \
+    pack_p(RS_f32, RP);                                                                                                  \
+    if constexpr (kStep < 2)                                                                                             \
+    {                                                                                                                    \
+      dequant_scale = q_scale * K_scale[k_scale_idx + blk + 1];                                                          \
+      sm_scale = original_sm_scale * dequant_scale;                                                                      \
+    }                                                                                                                    \
+    if constexpr (I8_PIPE == 1)                                                                                          \
+    {                                                                                                                    \
+      if constexpr (kStep < 2)                                                                                           \
+        cp_async::wait_group<1>();                                                                                       \
+      else                                                                                                               \
+        cp_async::wait_group<0>();                                                                                       \
+      __syncthreads();                                                                                                   \
+    }                                                                                                                    \
+    const uint32_t vb = (I8_PIPE >= 2) ? kb : 0;                                                                         \
+    compute_sv(smem_V, smem_VS + vb * HEAD, RP, RO, pmax, V_smem_offset_mma0 + vb * V_BUF_UNITS,                        \
+               V_smem_offset_mma1 + vb * V_BUF_UNITS, y_sc, y_any);                                                                   \
   }
 
 template <typename DTypeOut>
@@ -289,6 +439,9 @@ __global__ void __launch_bounds__(THREADS, I8_MIN_BLOCKS) qk_int_sv_i8_attn_kern
   float RO[1][TILES_V][8];
   float m[1][2];
   float d[1][2];
+  float anchor[2] = {-5000000.0f, -5000000.0f};
+  float y_sc[2] = {1.0f, 1.0f};
+  bool y_any = false;
 
   // per warp q scales (16 rows), per 64-key block k scales
   const uint32_t q_scale_idx = batch_id * num_qo_heads * (gridDim.x * NUM_WARPS) + head_id * (gridDim.x * NUM_WARPS) + bx * NUM_WARPS + warp_id;
@@ -336,14 +489,15 @@ __global__ void __launch_bounds__(THREADS, I8_MIN_BLOCKS) qk_int_sv_i8_attn_kern
 
   const uint32_t num_iterations = num_blocks_k;
 
-  // V^T of the next block (padded: no predicate) and, by warp 0, its 128 scales
-  auto load_v = [&]()
+  // V^T of the next block (padded: no predicate) into buffer vb and, by warp 0, its 128 scales
+  auto load_v = [&](const uint32_t vb)
   {
+    uint32_t v_off = V_smem_offset_load + vb * V_BUF_UNITS;
     load_fp8_V_global_to_share<4, 8, 1, HEAD / (NUM_WARPS * 8), SwizzleMode::k64B, CTA_K / 16, CTA_K>(
-      &V_lane_base_ptr, V_smem_offset_load, stride_d_v, smem_V);
+      &V_lane_base_ptr, v_off, stride_d_v, smem_V);
     if (warp_id == 0)
     {
-      cp_async::load_128b<cp_async::PrefetchMode::kPrefetch>(((b128_t*)smem_VS) + lane_id, (const b128_t*)VS_lane_ptr);
+      cp_async::load_128b<cp_async::PrefetchMode::kPrefetch>(((b128_t*)(smem_VS + vb * HEAD)) + lane_id, (const b128_t*)VS_lane_ptr);
     }
     VS_lane_ptr += HEAD;
   };
@@ -354,8 +508,124 @@ __global__ void __launch_bounds__(THREADS, I8_MIN_BLOCKS) qk_int_sv_i8_attn_kern
   cp_async::wait_group<0>();
   __syncthreads();
 
+#if I8_PIPE == 3
+  // ping-pong: warps 0-3 (A) run each block as above: V(w) load, Q.K^T, softmax, P.V; warps 4-7 (B) run half a block
+  // behind: the K(w + 1) load, P.V of block w - 1 (P and pmax carried in registers), then Q.K^T and softmax of block
+  // w - so on each scheduler one warp has tensor work while the other is in its softmax. Per warp the operations and
+  // their order are the other path's. Two K and two V buffers; one block barrier a block and a group barrier for A's V.
+  const bool group_a = warp_id < 4;
+  const uint32_t gw = warp_id % 4;
+  int8_t *KG_lane_ptr = K + batch_id * stride_bz_k + kv_head * stride_h_k + (CTA_K / 4 * gw + lane_id / 8) * stride_seq_k + (lane_id % 8) * 16;
+  int8_t *VG_lane_ptr = V + batch_id * stride_bz_v + kv_head * stride_h_v + (HEAD / 4 * gw + lane_id / 4) * stride_d_v + (lane_id % 4) * 16;
+  uint32_t KG_smem_offset_load = smem_K.get_permuted_offset(gw * 4 * (CTA_K / 16) + lane_id / 8, lane_id % 8);
+  uint32_t VG_smem_offset_load = smem_V.get_permuted_offset(gw * 8 * (HEAD / 32) + lane_id / 4, lane_id % 4);
+  uint32_t KG_load_idx = CTA_K / 4 * gw + lane_id / 8;
+  if (!group_a)
+  {
+    load_global_to_share<8, 4, 1, CTA_K / 16, SwizzleMode::k128B, HEAD / 16, CTA_K>(
+      &KG_lane_ptr, KG_smem_offset_load, stride_seq_k, smem_K, KG_load_idx, kv_len);
+    KG_load_idx += CTA_K;
+  }
+  cp_async::commit_group();
+  cp_async::wait_group<0>();
+  __syncthreads();
+  const float q_scale = Q_scale[q_scale_idx];
+  const float original_sm_scale = sm_scale;
+
+  // Q.K^T and the softmax of block W into RP, pmax (the steps' arithmetic: S * dequant for the last two blocks)
+#define SC3D_I8_QK_SOFTMAX(W)                                                                                            \
+  {                                                                                                                      \
+    const float dequant_w = q_scale * K_scale[k_scale_idx + (W)];                                                        \
+    uint32_t k_mma = K_smem_offset_mma + ((W) & 1) * K_BUF_UNITS;                                                        \
+    compute_int_qk<NUM_WARPS, 1, 1, TILES_K, TILES_QK_INNER, SwizzleMode::k128B, HEAD / 16, DataType::kInt8>(           \
+      smem_Q, smem_K, RS, Q_smem_offset_mma, k_mma);                                                                     \
+    float RS_f32[1][TILES_K][8];                                                                                         \
+    _Pragma("unroll")                                                                                                    \
+    for (uint32_t fk = 0; fk < TILES_K; fk++)                                                                            \
+    {                                                                                                                    \
+      _Pragma("unroll")                                                                                                  \
+      for (uint32_t k = 0; k < 8; k++)                                                                                   \
+        RS_f32[0][fk][k] = __int2float_rz(RS[0][fk][k]);                                                                 \
+    }                                                                                                                    \
+    float scale_w;                                                                                                       \
+    if ((W) + 2 < num_iterations)                                                                                        \
+    {                                                                                                                    \
+      scale_w = original_sm_scale * dequant_w;                                                                           \
+    }                                                                                                                    \
+    else                                                                                                                 \
+    {                                                                                                                    \
+      _Pragma("unroll")                                                                                                  \
+      for (uint32_t fk = 0; fk < TILES_K; fk++)                                                                          \
+      {                                                                                                                  \
+        _Pragma("unroll")                                                                                                \
+        for (uint32_t k = 0; k < 8; k++)                                                                                 \
+          RS_f32[0][fk][k] = RS_f32[0][fk][k] * dequant_w;                                                               \
+      }                                                                                                                  \
+      if ((W) + 1 == num_iterations)                                                                                     \
+        apply_out_of_bound_mask<1, TILES_K>(K_idx_lane_base + (W) * CTA_K, RS_f32, kv_len);                              \
+      scale_w = original_sm_scale;                                                                                       \
+    }                                                                                                                    \
+    update_mdo_blk(RS_f32, RO, m, d, pmax, anchor, y_sc, y_any, scale_w);                                                             \
+    pack_p(RS_f32, RP);                                                                                                  \
+  }
+
+  uint32_t RP[2][4];
+  float pmax[2];
+  for (uint32_t w = 0; w <= num_iterations; w++)
+  {
+    // here K(w) and V(w - 1) have arrived and are visible (the barrier closing the previous trip)
+    if (group_a)
+    {
+      if (w < num_iterations)
+      {
+        // V(w) into buffer w % 2 (it held V(w - 2), whose readers finished before the last barrier)
+        uint32_t v_off = VG_smem_offset_load + (w & 1) * V_BUF_UNITS;
+        load_fp8_V_global_to_share<4, 8, 1, HEAD / 32, SwizzleMode::k64B, CTA_K / 16, CTA_K>(
+          &VG_lane_ptr, v_off, stride_d_v, smem_V);
+        if (gw == 0)
+        {
+          cp_async::load_128b<cp_async::PrefetchMode::kPrefetch>(((b128_t*)(smem_VS + (w & 1) * HEAD)) + lane_id, (const b128_t*)VS_lane_ptr);
+        }
+        VS_lane_ptr += HEAD;
+        cp_async::commit_group();
+        SC3D_I8_QK_SOFTMAX(w)
+        cp_async::wait_group<0>();
+        asm volatile("bar.sync 1, 128;\n" ::: "memory");
+        compute_sv(smem_V, smem_VS + (w & 1) * HEAD, RP, RO, pmax, V_smem_offset_mma0 + (w & 1) * V_BUF_UNITS,
+                   V_smem_offset_mma1 + (w & 1) * V_BUF_UNITS, y_sc, y_any);
+      }
+    }
+    else
+    {
+      if (w + 1 < num_iterations)
+      {
+        // K(w + 1) into buffer (w + 1) % 2 (it held K(w - 1), whose readers finished before the last barrier)
+        uint32_t k_off = KG_smem_offset_load + ((w + 1) & 1) * K_BUF_UNITS;
+        load_global_to_share<8, 4, 1, CTA_K / 16, SwizzleMode::k128B, HEAD / 16, CTA_K>(
+          &KG_lane_ptr, k_off, stride_seq_k, smem_K, KG_load_idx, kv_len);
+        cp_async::commit_group();
+        KG_load_idx += CTA_K;
+      }
+      if (w >= 1)
+      {
+        compute_sv(smem_V, smem_VS + ((w - 1) & 1) * HEAD, RP, RO, pmax, V_smem_offset_mma0 + ((w - 1) & 1) * V_BUF_UNITS,
+                   V_smem_offset_mma1 + ((w - 1) & 1) * V_BUF_UNITS, y_sc, y_any);
+      }
+      if (w < num_iterations)
+      {
+        SC3D_I8_QK_SOFTMAX(w)
+      }
+      cp_async::wait_group<0>();
+    }
+    __syncthreads();
+  }
+#undef SC3D_I8_QK_SOFTMAX
+#else
   load_global_to_share<8, 4, 1, CTA_K / (NUM_WARPS * 4), SwizzleMode::k128B, HEAD / 16, CTA_K>(
     &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
+#if I8_PIPE >= 2
+  load_v(0);
+#endif
   cp_async::commit_group();
 
   float q_scale = Q_scale[q_scale_idx];
@@ -363,10 +633,28 @@ __global__ void __launch_bounds__(THREADS, I8_MIN_BLOCKS) qk_int_sv_i8_attn_kern
   float dequant_scale = q_scale * K_scale[k_scale_idx];
   sm_scale = original_sm_scale * dequant_scale;
 
-  load_v();
+#if I8_PIPE == 0
+  load_v(0);
   cp_async::commit_group();
+#endif
 
   K_load_idx_lane_base += CTA_K;
+
+#if I8_PIPE >= 1
+  uint32_t blk = 0;
+  for (; blk + 2 < num_iterations; blk++)
+  {
+    SC3D_I8_STEP_P(0)
+  }
+  if (num_iterations > 1)
+  {
+    SC3D_I8_STEP_P(1)
+    blk++;
+  }
+  {
+    SC3D_I8_STEP_P(2)
+  }
+#else
 
 #pragma unroll
   for (uint32_t iter = 1; iter < num_iterations - 1; iter++)
@@ -385,7 +673,24 @@ __global__ void __launch_bounds__(THREADS, I8_MIN_BLOCKS) qk_int_sv_i8_attn_kern
     const uint32_t next_block = 0;   // unused by the last step
     SC3D_I8_STEP(2)
   }
+#endif
+#endif
 
+#if I8_ANCHOR
+#pragma unroll
+  for (uint32_t k = 0; k < 2; k++)
+  {
+    const float f = math::ptx_exp2(anchor[k] - m[0][k]) * (1.0f / 255.0f);
+#pragma unroll
+    for (uint32_t fv = 0; fv < TILES_V; fv++)
+    {
+      RO[0][fv][k * 2 + 0] *= f;
+      RO[0][fv][k * 2 + 1] *= f;
+      RO[0][fv][k * 2 + 4] *= f;
+      RO[0][fv][k * 2 + 5] *= f;
+    }
+  }
+#endif
   normalize_d<1, TILES_V, ComputeUnit::kCudaCore>(RO, m, d);
 
   // the mean of v passes through the softmax weights
@@ -452,6 +757,7 @@ __global__ void __launch_bounds__(THREADS, I8_MIN_BLOCKS) qk_int_sv_i8_attn_kern
 }
 
 #undef SC3D_I8_STEP
+#undef SC3D_I8_STEP_P
 
 // ---- v: mean per channel over the tokens, then per 64-token block and channel: scale = max |v - mean| / 127 (1 for
 // an all-zero block), v_s8 = round(v - mean) / scale (to nearest even) in -127..127, written as V^T [B, H, 128, Npad]
