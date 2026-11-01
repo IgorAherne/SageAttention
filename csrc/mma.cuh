@@ -418,6 +418,54 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_s8s8s32(int32_t* C, u
 }
 
 /*!
+ * \brief Spellcast3D round K: the mma m16n8k32 instruction with an unsigned int8 A (P as 0..255) and a signed int8 B
+ *   (v), accumulated in int32.
+ */
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void mma_sync_m16n8k32_row_col_u8s8s32(int32_t* C, uint32_t* A,
+                                                                   uint32_t* B) {
+#ifdef MMA_S8S8S32_M16N8K32_ENABLED
+  if constexpr (mma_mode == MMAMode::kInplaceUpdate)
+  {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5,  %6,  %7},"
+        "{%8,  %9},"
+        "{%10, %11, %12, %13};\n"
+        : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
+        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]), "r"(C[0]), "r"(C[1]),
+          "r"(C[2]), "r"(C[3]));
+  }
+  else if constexpr (mma_mode == MMAMode::kInit)
+  {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5,  %6,  %7},"
+        "{%8,  %9},"
+        "{%10, %11, %12, %13};\n"
+        : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
+        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]), "r"(0), "r"(0),
+          "r"(0), "r"(0));
+  }
+#else
+  RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+#endif
+}
+
+/*!
+ * \brief Spellcast3D round K: m16n16k32 as two m16n8k32, unsigned int8 A, signed int8 B, int32 accumulators (the
+ *   accumulator layout of mma_sync_m16n16k32_row_col_s8s8s32).
+ */
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void mma_sync_m16n16k32_row_col_u8s8s32(int32_t* C, uint32_t* A,
+                                                                   uint32_t* B) {
+  mma_sync_m16n8k32_row_col_u8s8s32<mma_mode>(C, A, B);
+  mma_sync_m16n8k32_row_col_u8s8s32<mma_mode>(C + 4, A, B + 2);
+}
+
+/*!
  * \brief Wrapper of the mma m16n8k32 instruction for row major and column major int4 matrix
  *   multiplication, accumulated in int32.
  * \tparam mma_mode The mode of mma instruction, either kInit or kInplaceUpdate

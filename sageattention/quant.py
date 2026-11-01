@@ -295,3 +295,46 @@ def per_channel_fp8(
 
 
     
+
+
+def per_block_int8_v(
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    smooth_v: bool = True
+):
+    """
+    Spellcast3D round K: `v` for the int8 P.V op (``torch.ops.sageattention_qattn_sm80.
+    qk_int8_sv_i8_accum_i32_attn_inst_buf_sc3d``): the mean over the tokens per channel subtracted (``smooth_v``),
+    then int8 per 64-token block and channel - scale = max |v - mean| / 127 over the block (1 for an all-zero
+    block), round to nearest even - transposed and padded to a multiple of 64 tokens, the tokens of each 16 in the
+    order the k32 mma fragments read them (as ``per_channel_fp8`` permutes them). Deterministic.
+
+    Parameters
+    ----------
+    v : torch.Tensor
+        ``[batch_size, num_kv_heads, kv_len, 128]`` ("HND") or ``[batch_size, kv_len, num_kv_heads, 128]`` ("NHD"),
+        ``torch.float16`` or ``torch.bfloat16``, contiguous in the last dimension.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        - ``v_s8_t``: ``[batch_size, num_kv_heads, 128, (kv_len + 63) // 64 * 64]``, ``torch.int8`` (whichever layout).
+        - ``v_scale``: ``[batch_size, num_kv_heads, (kv_len + 63) // 64, 128]``, ``torch.float32``.
+        - ``v_mean``: ``[batch_size, num_kv_heads, 128]``, ``torch.float32`` (zeros when ``smooth_v`` is False).
+    """
+    from . import _qattn_sm80  # noqa: F401  (registers the op)
+
+    _tensor_layout = 0 if tensor_layout == "NHD" else 1
+    if tensor_layout == "HND":
+        b, h_kv, kv_len, head_dim = v.shape
+    elif tensor_layout == "NHD":
+        b, kv_len, h_kv, head_dim = v.shape
+    else:
+        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+    padded_len = (kv_len + 63) // 64 * 64
+    v_s8_t = torch.empty((b, h_kv, head_dim, padded_len), dtype=torch.int8, device=v.device)
+    v_scale = torch.empty((b, h_kv, padded_len // 64, head_dim), dtype=torch.float32, device=v.device)
+    v_mean = torch.empty((b, h_kv, head_dim), dtype=torch.float32, device=v.device)
+    torch.ops.sageattention_qattn_sm80.quant_per_block_int8_v_cuda(v, v_s8_t, v_scale, v_mean, _tensor_layout,
+                                                                   int(smooth_v))
+    return v_s8_t, v_scale, v_mean

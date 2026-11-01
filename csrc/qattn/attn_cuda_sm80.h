@@ -77,3 +77,25 @@ torch::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(torch::Tensor query,
                     int64_t qk_quant_gran,
                     double sm_scale,
                     int64_t return_lse);
+
+// Spellcast3D round K: the flows' kernel with its P.V on the int8 tensor cores (qk_int_sv_i8_cuda_sm80.cu)
+torch::Tensor qk_int8_sv_i8_accum_i32_attn_inst_buf_sc3d(torch::Tensor query,
+                    torch::Tensor key,
+                    torch::Tensor value,
+                    torch::Tensor output,
+                    torch::Tensor query_scale,
+                    torch::Tensor key_scale,
+                    torch::Tensor value_scale,
+                    torch::Tensor value_mean,
+                    int64_t tensor_layout,
+                    int64_t is_causal,
+                    int64_t qk_quant_gran,
+                    double sm_scale,
+                    int64_t return_lse);
+
+void quant_per_block_int8_v_cuda(torch::Tensor value,
+                    torch::Tensor value_t,
+                    torch::Tensor value_scale,
+                    torch::Tensor value_mean,
+                    int64_t tensor_layout,
+                    int64_t smooth_v);

@@ -107,6 +107,30 @@ TORCH_LIBRARY(sageattention_qattn_sm80, m) {
             "float sm_scale, "
             "int return_lse"
           ") -> Tensor");
+    // Spellcast3D round K: P.V on the int8 tensor cores (value: V^T int8 from quant_per_block_int8_v_cuda)
+    m.def("qk_int8_sv_i8_accum_i32_attn_inst_buf_sc3d("
+            "Tensor query, "
+            "Tensor key, "
+            "Tensor value, "
+            "Tensor(a!) output, "
+            "Tensor query_scale, "
+            "Tensor key_scale, "
+            "Tensor value_scale, "
+            "Tensor value_mean, "
+            "int tensor_layout, "
+            "int is_causal, "
+            "int qk_quant_gran, "
+            "float sm_scale, "
+            "int return_lse"
+          ") -> Tensor");
+    m.def("quant_per_block_int8_v_cuda("
+            "Tensor value, "
+            "Tensor(a!) value_t, "
+            "Tensor(b!) value_scale, "
+            "Tensor(c!) value_mean, "
+            "int tensor_layout, "
+            "int smooth_v"
+          ") -> ()");
 }
 
 // Registers CUDA implementations
@@ -116,4 +140,6 @@ TORCH_LIBRARY_IMPL(sageattention_qattn_sm80, CUDA, m) {
     m.impl("qk_int8_sv_f16_accum_f16_attn_inst_buf", &qk_int8_sv_f16_accum_f16_attn_inst_buf);
     m.impl("qk_int8_sv_f16_accum_f16_fuse_v_mean_attn", &qk_int8_sv_f16_accum_f16_fuse_v_mean_attn);
     m.impl("qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d", &qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d);
+    m.impl("qk_int8_sv_i8_accum_i32_attn_inst_buf_sc3d", &qk_int8_sv_i8_accum_i32_attn_inst_buf_sc3d);
+    m.impl("quant_per_block_int8_v_cuda", &quant_per_block_int8_v_cuda);
 }

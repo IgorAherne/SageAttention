@@ -149,6 +149,8 @@ if has_capability(("8.0", "8.6")):
         sources=[
             "csrc/qattn/pybind_sm80.cpp",
             "csrc/qattn/qk_int_sv_f16_cuda_sm80.cu",
+            # Spellcast3D round K: the flows' kernel with an int8 P.V, and its v quantiser
+            "csrc/qattn/qk_int_sv_i8_cuda_sm80.cu",
         ],
         extra_compile_args={
             "cxx": CXX_FLAGS,
