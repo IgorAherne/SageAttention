@@ -143,6 +143,23 @@ def sm80_ptx_flags():
 
 ext_modules = []
 
+if has_capability(("6.1",)):
+    # Spellcast3D round L: the Pascal (GTX 10xx) kernels - int8 Q.K^T and P.V by dp4a, no tensor cores; their own
+    # quantisers (fp32 / fp16 / bf16 in), op library sageattention_qattn_sm61
+    qattn_extension = CUDAExtension(
+        name="sageattention._qattn_sm61",
+        sources=[
+            "csrc/qattn/pybind_sm61.cpp",
+            "csrc/qattn/pascal/qattn_pascal.cu",
+        ],
+        extra_compile_args={
+            "cxx": CXX_FLAGS,
+            "nvcc": get_nvcc_flags(["6.1"]),
+        },
+        py_limited_api=True,
+    )
+    ext_modules.append(qattn_extension)
+
 if has_capability(("8.0", "8.6")):
     qattn_extension = CUDAExtension(
         name="sageattention._qattn_sm80",
