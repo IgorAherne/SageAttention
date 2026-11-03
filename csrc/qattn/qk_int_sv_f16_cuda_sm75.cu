@@ -44,6 +44,21 @@
 #ifndef SM75_SV_GROUP
 #define SM75_SV_GROUP 2
 #endif
+// the blocks' schedule: 0 one block after the other (two block barriers a block), 1 the ping-pong of the two warp
+// groups (two K and two V buffers: 64 KB of shared memory); the same operations in the same order per warp
+#ifndef SM75_PIPE
+#define SM75_PIPE 1
+#endif
+// S to float by the magic add (an integer and a float add, exact for |S| < 2^22) instead of I2F (Turing's
+// quarter-rate conversion unit, shared with exp2 and the fp16 rounding of P): the same values
+#ifndef SM75_I2F_MAGIC
+#define SM75_I2F_MAGIC 0
+#endif
+// timing study only (0 in the package; wrong answers), bits: 1 no P.V MMAs, 2 no Q.K^T MMAs, 4 no softmax, 8 no V
+// ldmatrix, 16 no K ldmatrix (what is left out costs nothing: its inputs are kept alive by empty asm statements)
+#ifndef SM75_STUDY
+#define SM75_STUDY 0
+#endif
 
 namespace sc3d_sm75 {
 
@@ -59,31 +74,34 @@ constexpr uint32_t TILES_V = HEAD / 16;          // 16-channel tiles of O
 constexpr uint32_t QK_STRIDE = HEAD / 16;        // 16-byte units in a row of Q or K (int8)
 constexpr uint32_t V_STRIDE = HEAD / 8;          // ... of V (fp16) and of O
 
-// Q int8 [128][128], K int8 [64][128], V fp16 [64][128]: 40 KB, one block an SM (Turing has 64 KB); O [128][128]
-// 16-bit at the end, over Q and K
+// Q int8 [128][128], K int8 [64][128] and V fp16 [64][128] once (SM75_PIPE 0: 40 KB) or twice (1: 64 KB, Turing's
+// most): one block an SM; O [128][128] 16-bit at the end, over Q and K
+constexpr uint32_t BUFFERS = (SM75_PIPE == 1) ? 2 : 1;
+constexpr uint32_t K_BUF_UNITS = CTA_K * HEAD / 16;                  // one tile in 16-byte units
+constexpr uint32_t V_BUF_UNITS = CTA_K * HEAD * sizeof(half) / 16;
 constexpr uint32_t SMEM_K_OFFSET = CTA_Q * HEAD;
-constexpr uint32_t SMEM_V_OFFSET = SMEM_K_OFFSET + CTA_K * HEAD;
-constexpr size_t SMEM_BYTES = (SMEM_V_OFFSET + CTA_K * HEAD * sizeof(half)) > (CTA_Q * HEAD * sizeof(half))
-                              ? (SMEM_V_OFFSET + CTA_K * HEAD * sizeof(half)) : (CTA_Q * HEAD * sizeof(half));
+constexpr uint32_t SMEM_V_OFFSET = SMEM_K_OFFSET + BUFFERS * CTA_K * HEAD;
+constexpr size_t SMEM_BYTES = (SMEM_V_OFFSET + BUFFERS * CTA_K * HEAD * sizeof(half)) > (CTA_Q * HEAD * sizeof(half))
+                              ? (SMEM_V_OFFSET + BUFFERS * CTA_K * HEAD * sizeof(half)) : (CTA_Q * HEAD * sizeof(half));
 
-// A tile of ROWS rows of UNITS 16-byte units, spread over the block's threads as sm_80's load_global_to_share
-// spreads it: a warp takes ROWS / NUM_WARPS rows, a lane the rows ROWS / NUM_WARPS * warp + lane / 8 + 4 i and the
-// units lane % 8 + 8 j
-template <uint32_t ROWS, uint32_t UNITS>
+// A tile of ROWS rows of UNITS 16-byte units, spread over WARPS warps as sm_80's load_global_to_share spreads it over
+// the block: a warp takes ROWS / WARPS rows, a lane the rows ROWS / WARPS * warp + lane / 8 + 4 i and the units
+// lane % 8 + 8 j
+template <uint32_t ROWS, uint32_t UNITS, uint32_t WARPS>
 struct tile_t
 {
-  static constexpr uint32_t ITERS_COL = ROWS / (NUM_WARPS * 4);
+  static constexpr uint32_t ITERS_COL = ROWS / (WARPS * 4);
   static constexpr uint32_t ITERS_ROW = UNITS / 8;
   static constexpr uint32_t REGS = ITERS_COL * ITERS_ROW;
-  static_assert(ROWS % (NUM_WARPS * 4) == 0 && UNITS % 8 == 0, "4 rows of 8 lanes a warp and step");
+  static_assert(ROWS % (WARPS * 4) == 0 && UNITS % 8 == 0, "4 rows of 8 lanes a warp and step");
 };
 
 // the lane's part of a tile from global memory into registers (lane_ptr: the lane's first unit, row_idx: its first
 // row's index); with kPred rows at or past max_len are zeros
-template <uint32_t ROWS, uint32_t UNITS, bool kPred>
+template <uint32_t ROWS, uint32_t UNITS, uint32_t WARPS, bool kPred>
 __device__ __forceinline__ void load_tile(uint4 *R, const int8_t *lane_ptr, const uint32_t stride_bytes, const uint32_t row_idx, const uint32_t max_len)
 {
-  using T = tile_t<ROWS, UNITS>;
+  using T = tile_t<ROWS, UNITS, WARPS>;
 #pragma unroll
   for (uint32_t i = 0; i < T::ITERS_COL; i++)
   {
@@ -101,10 +119,10 @@ __device__ __forceinline__ void load_tile(uint4 *R, const int8_t *lane_ptr, cons
 
 // ... and from registers into the (swizzled) shared memory tile, at the offsets of sm_80's walk (offset: the lane's
 // first unit)
-template <uint32_t ROWS, uint32_t UNITS, SwizzleMode swizzle_mode, uint32_t stride>
+template <uint32_t ROWS, uint32_t UNITS, uint32_t WARPS, SwizzleMode swizzle_mode, uint32_t stride>
 __device__ __forceinline__ void store_tile(const uint4 *R, const smem_t<swizzle_mode, stride> &smem, uint32_t offset)
 {
-  using T = tile_t<ROWS, UNITS>;
+  using T = tile_t<ROWS, UNITS, WARPS>;
 #pragma unroll
   for (uint32_t i = 0; i < T::ITERS_COL; i++)
   {
@@ -119,7 +137,7 @@ __device__ __forceinline__ void store_tile(const uint4 *R, const smem_t<swizzle_
 
 // compute_int_qk (attn_utils.cuh, Q and K from shared memory) with the m8n8k16 product
 __device__ __forceinline__ void compute_int_qk(const smem_t<SwizzleMode::k128B, QK_STRIDE> &smem_Q, const smem_t<SwizzleMode::k128B, QK_STRIDE> &smem_K,
-                                               int32_t RS[][TILES_K][8], uint32_t &offset_Q, uint32_t &offset_K)
+                                               int32_t RS[][TILES_K][8], uint32_t offset_Q, uint32_t offset_K)
 {
   uint32_t RQ[4];
   uint32_t RK[4];
@@ -132,17 +150,41 @@ __device__ __forceinline__ void compute_int_qk(const smem_t<SwizzleMode::k128B, 
 #pragma unroll
     for (uint32_t fk = 0; fk < TILES_K; fk++)
     {
+#if SM75_STUDY & 16
+#pragma unroll
+      for (uint32_t i = 0; i < 4; i++)
+        RK[i] = RQ[(i + fk) % 4];
+#else
       smem_K.ldmatrix_m8n8x4(offset_K, RK);
+#endif
       offset_K = smem_K.advance_offset_by_row<16>(offset_K);
+#if SM75_STUDY & 2
+      asm volatile("" :: "r"(RQ[0]), "r"(RQ[1]), "r"(RQ[2]), "r"(RQ[3]), "r"(RK[0]), "r"(RK[1]), "r"(RK[2]), "r"(RK[3]));
+      if (iter == 0)
+      {
+#pragma unroll
+        for (uint32_t i = 0; i < 8; i++)
+          RS[0][fk][i] = (int32_t)RK[i % 4];
+      }
+#else
       if (iter == 0)
         mma::mma_sync_m16n16k32_row_col_x8s8s32_sm75<mma::MMAMode::kInit>(RS[0][fk], RQ, RK);
       else
         mma::mma_sync_m16n16k32_row_col_x8s8s32_sm75<mma::MMAMode::kInplaceUpdate>(RS[0][fk], RQ, RK);
+#endif
     }
     offset_K = smem_K.advance_offset_by_column<2>(offset_K - (TILES_K * 16 * QK_STRIDE), iter);
   }
-  offset_Q -= (2 * TILES_QK_INNER);
-  offset_K -= (2 * TILES_QK_INNER);
+}
+
+// S as a float: exact either way (|S| <= 128 * 127^2 < 2^22)
+__device__ __forceinline__ float s_to_float(const int32_t x)
+{
+#if SM75_I2F_MAGIC
+  return __int_as_float(x + 0x4B400000) - 12582912.0f;
+#else
+  return __int2float_rz(x);
+#endif
 }
 
 // accumulate_d<kTensorCore> (attn_utils.cuh) with the m16n8k8 row sum
@@ -155,10 +197,105 @@ __device__ __forceinline__ void accumulate_d(uint32_t RS_f16[][TILES_K][4], floa
   }
 }
 
+// update_mdo (attn_utils.cuh, fp32 accumulators) with the accumulators' rescale left to the P.V step: m, d and P as
+// there, o_scale = exp2(m_prev - m) per row returned. sm_80's compiler fuses that rescale with the P.V step's add into
+// one FMA per accumulator, RO = fma(RO, o_scale, the block's fp16 sum) (its SASS: no FADD, 64 FFMA a block beside the
+// softmax's 32), so the P.V step does it in that form - in every block and for either schedule
+__device__ __forceinline__ void update_md(float RS[][TILES_K][8], float m[][2], float d[][2], float o_scale[2], const float &sm_scale)
+{
+#pragma unroll
+  for (uint32_t k = 0; k < 2; k++)
+  {
+    float m_prev = m[0][k];
+    float m_temp = -5000000.0f;
+#pragma unroll
+    for (uint32_t fk = 0; fk < TILES_K; fk++)
+    {
+      float m_local = max(max(RS[0][fk][k * 2 + 0], RS[0][fk][k * 2 + 1]),
+                          max(RS[0][fk][k * 2 + 4], RS[0][fk][k * 2 + 5]));
+      m_temp = max(m_temp, m_local);
+    }
+    m_temp *= sm_scale;
+    // exchange element with the 4 threads in the row
+    m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x1));
+    m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x2));
+
+    m[0][k] = max(m[0][k], m_temp);
+    o_scale[k] = math::ptx_exp2(m_prev - m[0][k]);
+    d[0][k] *= o_scale[k];
+
+    float negative_m = -m[0][k];
+#pragma unroll
+    for (uint32_t fk = 0; fk < TILES_K; fk++)
+    {
+      RS[0][fk][k * 2 + 0] = math::ptx_exp2(fmaf(RS[0][fk][k * 2 + 0], sm_scale, negative_m));
+      RS[0][fk][k * 2 + 1] = math::ptx_exp2(fmaf(RS[0][fk][k * 2 + 1], sm_scale, negative_m));
+      RS[0][fk][k * 2 + 4] = math::ptx_exp2(fmaf(RS[0][fk][k * 2 + 4], sm_scale, negative_m));
+      RS[0][fk][k * 2 + 5] = math::ptx_exp2(fmaf(RS[0][fk][k * 2 + 5], sm_scale, negative_m));
+    }
+  }
+}
+
+// The softmax of key block `iter` from its S as sm_80's steps do it: the main blocks with S unscaled and sm_scale *
+// dequant, the last two with S * dequant and sm_scale, the out-of-bound keys of the last masked; then the online
+// softmax (m, d, o_scale), P rounded to fp16 (RS_f16) and d += P's row sums on the tensor cores
+__device__ __forceinline__ void softmax(int32_t RS[][TILES_K][8], uint32_t RS_f16[][TILES_K][4], float o_scale[2], float m[][2], float d[][2],
+                                        const uint32_t iter, const uint32_t num_iterations, const float dequant_scale,
+                                        const float original_sm_scale, const uint32_t K_idx_lane_base, const uint32_t kv_len)
+{
+  float RS_f32[1][TILES_K][8];
+#if SM75_STUDY & 4
+#pragma unroll
+  for (uint32_t fk = 0; fk < TILES_K; fk++)
+  {
+#pragma unroll
+    for (uint32_t k = 0; k < 4; k++)
+      RS_f16[0][fk][k] = (uint32_t)RS[0][fk][2 * k] ^ (uint32_t)RS[0][fk][2 * k + 1];
+  }
+  o_scale[0] = o_scale[1] = 1.0f;
+  (void)RS_f32; (void)m; (void)d; (void)iter; (void)num_iterations; (void)dequant_scale;
+  (void)original_sm_scale; (void)K_idx_lane_base; (void)kv_len;
+  return;
+#endif
+  if (iter + 2 < num_iterations)
+  {
+#pragma unroll
+    for (uint32_t fk = 0; fk < TILES_K; fk++)
+    {
+#pragma unroll
+      for (uint32_t k = 0; k < 8; k++)
+      {
+        RS_f32[0][fk][k] = s_to_float(RS[0][fk][k]);
+      }
+    }
+    update_md(RS_f32, m, d, o_scale, original_sm_scale * dequant_scale);
+  }
+  else
+  {
+#pragma unroll
+    for (uint32_t fk = 0; fk < TILES_K; fk++)
+    {
+#pragma unroll
+      for (uint32_t k = 0; k < 8; k++)
+      {
+        RS_f32[0][fk][k] = s_to_float(RS[0][fk][k]) * dequant_scale;
+      }
+    }
+    if (iter + 1 == num_iterations)
+    {
+      apply_out_of_bound_mask<1, TILES_K>(K_idx_lane_base + iter * CTA_K, RS_f32, kv_len);
+    }
+    update_md(RS_f32, m, d, o_scale, original_sm_scale);
+  }
+  RS_32_to_16<1, TILES_K>(RS_f32, RS_f16);
+  accumulate_d(RS_f16, d);
+}
+
 // The P.V step of the tuned sm_80 kernel (sc3d_sv_fv: SM75_SV_GROUP output column tiles at a time, each summing its
-// four 16-key steps in fp16 and then added to the fp32 accumulators) with the m16n8k8 product; the shared-memory
-// offsets are its closed form of the k128B walk
-__device__ __forceinline__ void compute_sv(const smem_t<SwizzleMode::k128B, V_STRIDE> &smem_V, uint32_t RS_f16[][TILES_K][4], float RO[][TILES_V][8], const uint32_t offset_V)
+// four 16-key steps in fp16) with the m16n8k8 product; then RO = fma(RO, o_scale, the sum) (update_md). The
+// shared-memory offsets are sc3d_sv_fv's closed form of the k128B walk
+__device__ __forceinline__ void compute_sv(const smem_t<SwizzleMode::k128B, V_STRIDE> &smem_V, uint32_t RS_f16[][TILES_K][4], float RO[][TILES_V][8],
+                                           const float o_scale[2], const uint32_t offset_V)
 {
   constexpr uint32_t group = SM75_SV_GROUP;
   static_assert(TILES_V % group == 0, "SM75_SV_GROUP divides the 8 output column tiles");
@@ -174,25 +311,42 @@ __device__ __forceinline__ void compute_sv(const smem_t<SwizzleMode::k128B, V_ST
       {
         const uint32_t fv = fv0 + j;
         uint32_t RV[4];
+#if SM75_STUDY & 8
+#pragma unroll
+        for (uint32_t i = 0; i < 4; i++)
+          RV[i] = RS_f16[0][(fk + j) % TILES_K][i];
+#else
         smem_V.ldmatrix_m8n8x4_trans(((offset_V + (fv / 4) * 8) ^ (2 * (fv % 4))) + fk * 16 * V_STRIDE, RV);
+#endif
+#if SM75_STUDY & 1
+        asm volatile("" :: "r"(RV[0]), "r"(RV[1]), "r"(RV[2]), "r"(RV[3]));
+        if (fk == 0)
+        {
+#pragma unroll
+          for (uint32_t i = 0; i < 4; i++)
+            buf[j][i] = RS_f16[0][fk][i];
+        }
+#else
         if (fk == 0)
           mma::mma_sync_m16n16k16_row_col_f16f16f16_sm75<mma::MMAMode::kInit>(buf[j], RS_f16[0][fk], RV);
         else
           mma::mma_sync_m16n16k16_row_col_f16f16f16_sm75<mma::MMAMode::kInplaceUpdate>(buf[j], RS_f16[0][fk], RV);
+#endif
       }
     }
+    // accumulator elements 0, 1, 4, 5: row g; 2, 3, 6, 7: row g + 8
 #pragma unroll
     for (uint32_t j = 0; j < group; j++)
     {
       const uint32_t fv = fv0 + j;
-      RO[0][fv][0] += __half2float(((half2*)buf[j])[0].x);
-      RO[0][fv][1] += __half2float(((half2*)buf[j])[0].y);
-      RO[0][fv][2] += __half2float(((half2*)buf[j])[1].x);
-      RO[0][fv][3] += __half2float(((half2*)buf[j])[1].y);
-      RO[0][fv][4] += __half2float(((half2*)buf[j])[2].x);
-      RO[0][fv][5] += __half2float(((half2*)buf[j])[2].y);
-      RO[0][fv][6] += __half2float(((half2*)buf[j])[3].x);
-      RO[0][fv][7] += __half2float(((half2*)buf[j])[3].y);
+      RO[0][fv][0] = fmaf(RO[0][fv][0], o_scale[0], __half2float(((half2*)buf[j])[0].x));
+      RO[0][fv][1] = fmaf(RO[0][fv][1], o_scale[0], __half2float(((half2*)buf[j])[0].y));
+      RO[0][fv][2] = fmaf(RO[0][fv][2], o_scale[1], __half2float(((half2*)buf[j])[1].x));
+      RO[0][fv][3] = fmaf(RO[0][fv][3], o_scale[1], __half2float(((half2*)buf[j])[1].y));
+      RO[0][fv][4] = fmaf(RO[0][fv][4], o_scale[0], __half2float(((half2*)buf[j])[2].x));
+      RO[0][fv][5] = fmaf(RO[0][fv][5], o_scale[0], __half2float(((half2*)buf[j])[2].y));
+      RO[0][fv][6] = fmaf(RO[0][fv][6], o_scale[1], __half2float(((half2*)buf[j])[3].x));
+      RO[0][fv][7] = fmaf(RO[0][fv][7], o_scale[1], __half2float(((half2*)buf[j])[3].y));
     }
   }
 }
@@ -225,7 +379,6 @@ __global__ void __launch_bounds__(THREADS, 1) qk_int_sv_f16_attn_kernel(const in
   // base 2 instead of base e, as sm_80
   sm_scale *= math::log2e;
 
-  int32_t RS[1][TILES_K][8];
   float RO[1][TILES_V][8];
   float m[1][2];
   float d[1][2];
@@ -248,119 +401,167 @@ __global__ void __launch_bounds__(THREADS, 1) qk_int_sv_f16_attn_kernel(const in
 
   // per warp q scales (16 rows), per 64-key block k scales
   const uint32_t q_scale_idx = batch_id * num_qo_heads * (gridDim.x * NUM_WARPS) + head_id * (gridDim.x * NUM_WARPS) + bx * NUM_WARPS + warp_id;
-  const uint32_t k_scale_idx = batch_id * num_kv_heads * num_iterations + kv_head * num_iterations;
+  const float *K_scale_ptr = K_scale + batch_id * num_kv_heads * num_iterations + kv_head * num_iterations;
 
   smem_t<SwizzleMode::k128B, QK_STRIDE> smem_Q(smem);
   smem_t<SwizzleMode::k128B, QK_STRIDE> smem_K(smem + SMEM_K_OFFSET);
   smem_t<SwizzleMode::k128B, V_STRIDE> smem_V(smem + SMEM_V_OFFSET);
   smem_t<SwizzleMode::k128B, V_STRIDE> smem_O(smem);
 
-  // loads: rows of Q / K of 128 bytes and of V of 256 bytes, 8 lanes a 128 bytes, 4 rows a warp and step
+  // Q: rows of 128 bytes, 8 lanes a row, 4 rows a warp and step, all warps
   const int8_t *Q_lane_ptr = Q + batch_id * stride_bz_q + head_id * stride_h_q + (bx * CTA_Q + CTA_Q / NUM_WARPS * warp_id + lane_id / 8) * stride_seq_q + (lane_id % 8) * 16;
-  const int8_t *K_lane_ptr = K + batch_id * stride_bz_k + kv_head * stride_h_k + (CTA_K / NUM_WARPS * warp_id + lane_id / 8) * stride_seq_k + (lane_id % 8) * 16;
-  const int8_t *V_lane_ptr = reinterpret_cast<const int8_t*>(V + batch_id * stride_bz_v + kv_head * stride_h_v + (CTA_K / NUM_WARPS * warp_id + lane_id / 8) * stride_seq_v + (lane_id % 8) * 8);
   const uint32_t Q_load_idx = bx * CTA_Q + CTA_Q / NUM_WARPS * warp_id + lane_id / 8;
-  uint32_t KV_load_idx = CTA_K / NUM_WARPS * warp_id + lane_id / 8;
   const uint32_t Q_smem_offset_load = smem_Q.get_permuted_offset(CTA_Q / NUM_WARPS * warp_id + lane_id / 8, lane_id % 8);
-  const uint32_t K_smem_offset_load = smem_K.get_permuted_offset(CTA_K / NUM_WARPS * warp_id + lane_id / 8, lane_id % 8);
-  const uint32_t V_smem_offset_load = smem_V.get_permuted_offset(CTA_K / NUM_WARPS * warp_id + lane_id / 8, lane_id % 8);
   const uint32_t K_stride_bytes = stride_seq_k;
   const uint32_t V_stride_bytes = stride_seq_v * sizeof(half);
 
-  uint32_t Q_smem_offset_mma = smem_Q.get_permuted_offset(warp_id * WARP_Q + lane_id % 16, lane_id / 16);
-  uint32_t K_smem_offset_mma = smem_K.get_permuted_offset(lane_id % 8 + (lane_id / 16) * 8, (lane_id / 8) % 2);
+  const uint32_t Q_smem_offset_mma = smem_Q.get_permuted_offset(warp_id * WARP_Q + lane_id % 16, lane_id / 16);
+  const uint32_t K_smem_offset_mma = smem_K.get_permuted_offset(lane_id % 8 + (lane_id / 16) * 8, (lane_id / 8) % 2);
   const uint32_t V_smem_offset_mma = smem_V.get_permuted_offset(lane_id % 16, lane_id / 16);
 
   const uint32_t K_idx_lane_base = 2 * (lane_id % 4);
 
-  using QTile = tile_t<CTA_Q, QK_STRIDE>;
-  using KTile = tile_t<CTA_K, QK_STRIDE>;
-  using VTile = tile_t<CTA_K, V_STRIDE>;
+  {
+    uint4 RQ_load[tile_t<CTA_Q, QK_STRIDE, NUM_WARPS>::REGS];
+    load_tile<CTA_Q, QK_STRIDE, NUM_WARPS, true>(RQ_load, Q_lane_ptr, stride_seq_q, Q_load_idx, qo_len);
+    store_tile<CTA_Q, QK_STRIDE, NUM_WARPS>(RQ_load, smem_Q, Q_smem_offset_load);
+  }
+  const float q_scale = Q_scale[q_scale_idx];
+  const float original_sm_scale = sm_scale;
+
+#if SM75_PIPE == 1
+  // The ping-pong (round K's int8 P.V kernel, round J's sv_kernel_pp.cuh): warps 0-3 (group A) run each block w in
+  // order - the V(w) load, Q.K^T, softmax, P.V; warps 4-7 (group B, one on each scheduler beside an A warp) run half a
+  // block behind - the K(w + 1) load, P.V of block w - 1 (its P carried in registers), then Q.K^T and softmax of block
+  // w - so while one warp of a scheduler is in its softmax the other has tensor work. Per warp the operations and
+  // their order are those of one block after the other. Two K and two V buffers, one block barrier a trip and a group
+  // barrier for A's V.
+  constexpr uint32_t GROUP_WARPS = NUM_WARPS / 2;
+  const bool group_a = warp_id < GROUP_WARPS;
+  const uint32_t gw = warp_id % GROUP_WARPS;
+  const int8_t *K_lane_ptr = K + batch_id * stride_bz_k + kv_head * stride_h_k + (CTA_K / GROUP_WARPS * gw + lane_id / 8) * stride_seq_k + (lane_id % 8) * 16;
+  const int8_t *V_lane_ptr = reinterpret_cast<const int8_t*>(V + batch_id * stride_bz_v + kv_head * stride_h_v + (CTA_K / GROUP_WARPS * gw + lane_id / 8) * stride_seq_v + (lane_id % 8) * 8);
+  uint32_t KV_load_idx = CTA_K / GROUP_WARPS * gw + lane_id / 8;
+  const uint32_t K_smem_offset_load = smem_K.get_permuted_offset(CTA_K / GROUP_WARPS * gw + lane_id / 8, lane_id % 8);
+  const uint32_t V_smem_offset_load = smem_V.get_permuted_offset(CTA_K / GROUP_WARPS * gw + lane_id / 8, lane_id % 8);
+  using KTile = tile_t<CTA_K, QK_STRIDE, GROUP_WARPS>;
+  using VTile = tile_t<CTA_K, V_STRIDE, GROUP_WARPS>;
+
+  if (!group_a)
+  {
+    uint4 RK_load[KTile::REGS];
+    load_tile<CTA_K, QK_STRIDE, GROUP_WARPS, true>(RK_load, K_lane_ptr, K_stride_bytes, KV_load_idx, kv_len);
+    store_tile<CTA_K, QK_STRIDE, GROUP_WARPS>(RK_load, smem_K, K_smem_offset_load);
+    K_lane_ptr += CTA_K * K_stride_bytes;
+  }
+  __syncthreads();
+
+  uint32_t RS_f16[1][TILES_K][4];       // group B: P of the block before and its rows' o_scale, from one trip to the next
+  float o_scale[2];
+  for (uint32_t w = 0; w <= num_iterations; w++)
+  {
+    // here K(w) is in buffer w % 2 and V(w - 1) in buffer (w - 1) % 2, both visible (the barrier closing the trip)
+    if (group_a)
+    {
+      if (w < num_iterations)
+      {
+        // V(w) into buffer w % 2 (it held V(w - 2), whose readers finished before the last barrier)
+        uint4 RV_load[VTile::REGS];
+        if (w + 1 == num_iterations)
+          load_tile<CTA_K, V_STRIDE, GROUP_WARPS, true>(RV_load, V_lane_ptr, V_stride_bytes, KV_load_idx + w * CTA_K, kv_len);
+        else
+          load_tile<CTA_K, V_STRIDE, GROUP_WARPS, false>(RV_load, V_lane_ptr, V_stride_bytes, KV_load_idx + w * CTA_K, kv_len);
+        V_lane_ptr += CTA_K * V_stride_bytes;
+        int32_t RS[1][TILES_K][8];
+        compute_int_qk(smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma + (w & 1) * K_BUF_UNITS);
+        softmax(RS, RS_f16, o_scale, m, d, w, num_iterations, q_scale * K_scale_ptr[w], original_sm_scale, K_idx_lane_base, kv_len);
+        store_tile<CTA_K, V_STRIDE, GROUP_WARPS>(RV_load, smem_V, V_smem_offset_load + (w & 1) * V_BUF_UNITS);
+        asm volatile("bar.sync 1, %0;\n" :: "n"(GROUP_WARPS * 32) : "memory");     // group A's V(w) visible to group A
+        compute_sv(smem_V, RS_f16, RO, o_scale, V_smem_offset_mma + (w & 1) * V_BUF_UNITS);
+      }
+    }
+    else
+    {
+      // K(w + 1) into buffer (w + 1) % 2 (it held K(w - 1), whose readers finished before the last barrier)
+      const bool has_next = w + 1 < num_iterations;
+      uint4 RK_load[KTile::REGS];
+      if (has_next)
+      {
+        if (w + 2 == num_iterations)
+          load_tile<CTA_K, QK_STRIDE, GROUP_WARPS, true>(RK_load, K_lane_ptr, K_stride_bytes, KV_load_idx + (w + 1) * CTA_K, kv_len);
+        else
+          load_tile<CTA_K, QK_STRIDE, GROUP_WARPS, false>(RK_load, K_lane_ptr, K_stride_bytes, KV_load_idx + (w + 1) * CTA_K, kv_len);
+        K_lane_ptr += CTA_K * K_stride_bytes;
+      }
+      if (w >= 1)
+      {
+        compute_sv(smem_V, RS_f16, RO, o_scale, V_smem_offset_mma + ((w - 1) & 1) * V_BUF_UNITS);
+      }
+      if (has_next)
+      {
+        store_tile<CTA_K, QK_STRIDE, GROUP_WARPS>(RK_load, smem_K, K_smem_offset_load + ((w + 1) & 1) * K_BUF_UNITS);
+      }
+      if (w < num_iterations)
+      {
+        int32_t RS[1][TILES_K][8];
+        compute_int_qk(smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma + (w & 1) * K_BUF_UNITS);
+        softmax(RS, RS_f16, o_scale, m, d, w, num_iterations, q_scale * K_scale_ptr[w], original_sm_scale, K_idx_lane_base, kv_len);
+      }
+    }
+    __syncthreads();
+  }
+#else
+  // one block after the other: K(iter) in shared memory and V(iter) in registers at the top; V stored after Q.K^T,
+  // K(iter + 1) loaded during the softmax and P.V and stored after them, V(iter + 1) loaded during the next Q.K^T
+  const int8_t *K_lane_ptr = K + batch_id * stride_bz_k + kv_head * stride_h_k + (CTA_K / NUM_WARPS * warp_id + lane_id / 8) * stride_seq_k + (lane_id % 8) * 16;
+  const int8_t *V_lane_ptr = reinterpret_cast<const int8_t*>(V + batch_id * stride_bz_v + kv_head * stride_h_v + (CTA_K / NUM_WARPS * warp_id + lane_id / 8) * stride_seq_v + (lane_id % 8) * 8);
+  uint32_t KV_load_idx = CTA_K / NUM_WARPS * warp_id + lane_id / 8;
+  const uint32_t K_smem_offset_load = smem_K.get_permuted_offset(CTA_K / NUM_WARPS * warp_id + lane_id / 8, lane_id % 8);
+  const uint32_t V_smem_offset_load = smem_V.get_permuted_offset(CTA_K / NUM_WARPS * warp_id + lane_id / 8, lane_id % 8);
+  using KTile = tile_t<CTA_K, QK_STRIDE, NUM_WARPS>;
+  using VTile = tile_t<CTA_K, V_STRIDE, NUM_WARPS>;
   uint4 RK_next[KTile::REGS];
   uint4 RV_next[VTile::REGS];
-  {
-    uint4 RQ_load[QTile::REGS];
-    load_tile<CTA_Q, QK_STRIDE, true>(RQ_load, Q_lane_ptr, stride_seq_q, Q_load_idx, qo_len);
-    load_tile<CTA_K, QK_STRIDE, true>(RK_next, K_lane_ptr, K_stride_bytes, KV_load_idx, kv_len);
-    load_tile<CTA_K, V_STRIDE, true>(RV_next, V_lane_ptr, V_stride_bytes, KV_load_idx, kv_len);
-    store_tile<CTA_Q, QK_STRIDE>(RQ_load, smem_Q, Q_smem_offset_load);
-    store_tile<CTA_K, QK_STRIDE>(RK_next, smem_K, K_smem_offset_load);
-  }
+  load_tile<CTA_K, QK_STRIDE, NUM_WARPS, true>(RK_next, K_lane_ptr, K_stride_bytes, KV_load_idx, kv_len);
+  load_tile<CTA_K, V_STRIDE, NUM_WARPS, true>(RV_next, V_lane_ptr, V_stride_bytes, KV_load_idx, kv_len);
+  store_tile<CTA_K, QK_STRIDE, NUM_WARPS>(RK_next, smem_K, K_smem_offset_load);
   K_lane_ptr += CTA_K * K_stride_bytes;
   V_lane_ptr += CTA_K * V_stride_bytes;
   KV_load_idx += CTA_K;
   __syncthreads();
 
-  const float q_scale = Q_scale[q_scale_idx];
-  const float original_sm_scale = sm_scale;
-
   for (uint32_t iter = 0; iter < num_iterations; iter++)
   {
-    // here K(iter) is in shared memory and V(iter) on its way into RV_next; V's shared tile is free
+    int32_t RS[1][TILES_K][8];
     compute_int_qk(smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
 
-    store_tile<CTA_K, V_STRIDE>(RV_next, smem_V, V_smem_offset_load);
+    store_tile<CTA_K, V_STRIDE, NUM_WARPS>(RV_next, smem_V, V_smem_offset_load);
     const bool has_next = iter + 1 < num_iterations;
     const bool next_is_last = iter + 2 == num_iterations;
     if (has_next)
     {
       if (next_is_last)
-        load_tile<CTA_K, QK_STRIDE, true>(RK_next, K_lane_ptr, K_stride_bytes, KV_load_idx, kv_len);
+        load_tile<CTA_K, QK_STRIDE, NUM_WARPS, true>(RK_next, K_lane_ptr, K_stride_bytes, KV_load_idx, kv_len);
       else
-        load_tile<CTA_K, QK_STRIDE, false>(RK_next, K_lane_ptr, K_stride_bytes, KV_load_idx, kv_len);
-    }
-
-    // S as sm_80 converts it: the main blocks unscaled with sm_scale * dequant, the last two times dequant with
-    // sm_scale, the out-of-bound keys of the last masked
-    const float dequant_scale = q_scale * K_scale[k_scale_idx + iter];
-    float RS_f32[1][TILES_K][8];
-    if (iter + 2 < num_iterations)
-    {
-#pragma unroll
-      for (uint32_t fk = 0; fk < TILES_K; fk++)
-      {
-#pragma unroll
-        for (uint32_t k = 0; k < 8; k++)
-        {
-          RS_f32[0][fk][k] = __int2float_rz(RS[0][fk][k]);
-        }
-      }
-      update_mdo<1, TILES_K, TILES_V, false, false, false>(RS_f32, RO, m, d, original_sm_scale * dequant_scale);
-    }
-    else
-    {
-#pragma unroll
-      for (uint32_t fk = 0; fk < TILES_K; fk++)
-      {
-#pragma unroll
-        for (uint32_t k = 0; k < 8; k++)
-        {
-          RS_f32[0][fk][k] = __int2float_rz(RS[0][fk][k]) * dequant_scale;
-        }
-      }
-      if (iter + 1 == num_iterations)
-      {
-        apply_out_of_bound_mask<1, TILES_K>(K_idx_lane_base + iter * CTA_K, RS_f32, kv_len);
-      }
-      update_mdo<1, TILES_K, TILES_V, false, false, false>(RS_f32, RO, m, d, original_sm_scale);
+        load_tile<CTA_K, QK_STRIDE, NUM_WARPS, false>(RK_next, K_lane_ptr, K_stride_bytes, KV_load_idx, kv_len);
     }
 
     uint32_t RS_f16[1][TILES_K][4];
-    RS_32_to_16<1, TILES_K>(RS_f32, RS_f16);
-    accumulate_d(RS_f16, d);
+    float o_scale[2];
+    softmax(RS, RS_f16, o_scale, m, d, iter, num_iterations, q_scale * K_scale_ptr[iter], original_sm_scale, K_idx_lane_base, kv_len);
 
     // V(iter) visible to every warp, and every warp done with K(iter)
     __syncthreads();
 
-    compute_sv(smem_V, RS_f16, RO, V_smem_offset_mma);
+    compute_sv(smem_V, RS_f16, RO, o_scale, V_smem_offset_mma);
 
     if (has_next)
     {
-      store_tile<CTA_K, QK_STRIDE>(RK_next, smem_K, K_smem_offset_load);
+      store_tile<CTA_K, QK_STRIDE, NUM_WARPS>(RK_next, smem_K, K_smem_offset_load);
       if (next_is_last)
-        load_tile<CTA_K, V_STRIDE, true>(RV_next, V_lane_ptr, V_stride_bytes, KV_load_idx, kv_len);
+        load_tile<CTA_K, V_STRIDE, NUM_WARPS, true>(RV_next, V_lane_ptr, V_stride_bytes, KV_load_idx, kv_len);
       else
-        load_tile<CTA_K, V_STRIDE, false>(RV_next, V_lane_ptr, V_stride_bytes, KV_load_idx, kv_len);
+        load_tile<CTA_K, V_STRIDE, NUM_WARPS, false>(RV_next, V_lane_ptr, V_stride_bytes, KV_load_idx, kv_len);
       K_lane_ptr += CTA_K * K_stride_bytes;
       V_lane_ptr += CTA_K * V_stride_bytes;
       KV_load_idx += CTA_K;
@@ -369,6 +570,7 @@ __global__ void __launch_bounds__(THREADS, 1) qk_int_sv_f16_attn_kernel(const in
     // K(iter + 1) visible to every warp, and every warp done with V(iter)
     __syncthreads();
   }
+#endif
 
   normalize_d<1, TILES_V, ComputeUnit::kTensorCore>(RO, m, d);
 
