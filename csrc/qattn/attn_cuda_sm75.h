@@ -30,3 +30,26 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d_sm75(torch::Tensor que
                     int64_t qk_quant_gran,
                     double sm_scale,
                     int64_t return_lse);
+
+// the int8 P.V twin (qk_int_sv_i8_cuda_sm75.cu): _qattn_sm80's qk_int8_sv_i8_accum_i32_attn_inst_buf_sc3d for Turing
+torch::Tensor qk_int8_sv_i8_accum_i32_attn_inst_buf_sc3d_sm75(torch::Tensor query,
+                    torch::Tensor key,
+                    torch::Tensor value,
+                    torch::Tensor output,
+                    torch::Tensor query_scale,
+                    torch::Tensor key_scale,
+                    torch::Tensor value_scale,
+                    torch::Tensor value_mean,
+                    int64_t tensor_layout,
+                    int64_t is_causal,
+                    int64_t qk_quant_gran,
+                    double sm_scale,
+                    int64_t return_lse);
+
+// its v quantiser: qk_int_sv_i8_cuda_sm80.cu's, compiled for sm_75
+void quant_per_block_int8_v_cuda(torch::Tensor value,
+                    torch::Tensor value_t,
+                    torch::Tensor value_scale,
+                    torch::Tensor value_mean,
+                    int64_t tensor_layout,
+                    int64_t smooth_v);
