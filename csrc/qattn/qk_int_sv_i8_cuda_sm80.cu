@@ -142,6 +142,10 @@ __device__ __forceinline__ void pack_p(float RS[][TILES_K][8], uint32_t RP[2][4]
   }
 }
 
+// SC3D_I8_QUANT_ONLY (qk_int_sv_i8_cuda_sm75.cu, Spellcast3D round L): this file without its sm_80 P.V step,
+// attention kernel and op - the softmax helpers above and v's quantiser below, for another architecture
+#ifndef SC3D_I8_QUANT_ONLY
+
 // P.V of one block: per 16-channel tile, the int32 product over the 64 keys (V^T fragments by ldmatrix, two
 // m16n16k32 u8 x s8), then RO = product * (pmax / 255) * v_scale + RO (* o_scale with kRescale) per row and channel
 template <bool kRescale>
@@ -459,6 +463,8 @@ __global__ void __launch_bounds__(THREADS, 2) qk_int_sv_i8_attn_kernel(int8_t *_
   }
 }
 
+#endif // SC3D_I8_QUANT_ONLY
+
 // ---- v: mean per channel over the tokens, then per 64-token block and channel: scale = max |v - mean| / 127 (1 for
 // an all-zero block), v_s8 = round(v - mean) / scale (to nearest even) in -127..127, written as V^T [B, H, 128, Npad]
 // with the tokens of each 16 in the order the k32 fragments read them (the fp8 kernels' permutation)
@@ -566,6 +572,7 @@ __global__ void __launch_bounds__(VQ_THREADS) v_quant_kernel(const T *__restrict
 
 } // namespace sc3d_i8
 
+#ifndef SC3D_I8_QUANT_ONLY
 // tensor_layout 0 for [B, N, H, D], 1 for [B, H, N, D] (query, key, output); value: V^T [B, H_kv, 128, Npad] int8 with
 // value_scale [B, H_kv, Npad / 64, 128] and value_mean [B, H_kv, 128] fp32, as quant_per_block_int8_v_cuda makes them.
 // Implemented: head 128, not causal, per_warp q / k scales (BLKQ 128, WARPQ 16, BLKK 64), no LSE, bf16 or fp16 out.
@@ -706,6 +713,8 @@ torch::Tensor qk_int8_sv_i8_accum_i32_attn_inst_buf_sc3d(torch::Tensor query,
 
   return torch::empty({0});
 }
+
+#endif // SC3D_I8_QUANT_ONLY
 
 // value [B, N, H, 128] (tensor_layout 0) or [B, H, N, 128] (1), fp16 or bf16, last dimension contiguous ->
 // value_t [B, H, 128, Npad] int8, value_scale [B, H, Npad / 64, 128], value_mean [B, H, 128] fp32 (zeros, and nothing

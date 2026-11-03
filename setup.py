@@ -150,6 +150,8 @@ if has_capability(("7.5",)):
         sources=[
             "csrc/qattn/pybind_sm75.cpp",
             "csrc/qattn/qk_int_sv_f16_cuda_sm75.cu",
+            # its int8 P.V twin and v's quantiser
+            "csrc/qattn/qk_int_sv_i8_cuda_sm75.cu",
         ],
         extra_compile_args={
             "cxx": CXX_FLAGS,
