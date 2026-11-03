@@ -143,6 +143,22 @@ def sm80_ptx_flags():
 
 ext_modules = []
 
+if has_capability(("7.5",)):
+    # Spellcast3D round L: the flows' kernel (_qattn_sm80's qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d) for Turing
+    qattn_extension = CUDAExtension(
+        name="sageattention._qattn_sm75",
+        sources=[
+            "csrc/qattn/pybind_sm75.cpp",
+            "csrc/qattn/qk_int_sv_f16_cuda_sm75.cu",
+        ],
+        extra_compile_args={
+            "cxx": CXX_FLAGS,
+            "nvcc": get_nvcc_flags(["7.5"]),
+        },
+        py_limited_api=True,
+    )
+    ext_modules.append(qattn_extension)
+
 if has_capability(("8.0", "8.6")):
     qattn_extension = CUDAExtension(
         name="sageattention._qattn_sm80",
@@ -201,13 +217,13 @@ if has_capability(("9.0",)):
     )
     ext_modules.append(qattn_extension)
 
-# Fused kernels.
+# Fused kernels. Spellcast3D round L: also for 7.5 (the quantisers the Turing kernel's callers use)
 fused_extension = CUDAExtension(
     name="sageattention._fused",
     sources=["csrc/fused/pybind.cpp", "csrc/fused/fused.cu"],
     extra_compile_args={
         "cxx": CXX_FLAGS,
-        "nvcc": get_nvcc_flags(["8.0", "8.9", "9.0", "12.0"]),
+        "nvcc": get_nvcc_flags(["7.5", "8.0", "8.9", "9.0", "12.0"]),
     },
     py_limited_api=True,
 )

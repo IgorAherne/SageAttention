@@ -35,6 +35,7 @@ namespace mma{
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 750))
 #define MMA_F16F16F32_M16N8K8_ENABLED
 #define MMA_F16F16F16_M16N8K8_ENABLED
+#define MMA_S8S8S32_M8N8K16_ENABLED
 #define LDMATRIX_M8N8X2_ENABLED
 #define LDMATRIX_M8N8X4_ENABLED
 #endif
@@ -762,6 +763,119 @@ __device__ __forceinline__ void rowsum_f8f8f32(float* d, uint32_t* s) {
       : "=f"(d[0]), "=f"(d[1])
       : "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(943208504), "r"(943208504), // 943208504 packs four 1.0f in e4m3
         "f"(d[0]), "f"(d[1]));
+#else
+  RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+#endif
+}
+
+/*
+ * Spellcast3D round L: the m16n16 products above from Turing's (sm_75) instruction shapes, on the same fragments (the
+ * same ldmatrix loads feed them). Per n8 half of the m16n16 tile: C[0], C[1] are row g = lane / 4, C[2], C[3] row
+ * g + 8; A[0] / A[1] hold rows g / g + 8 of the first half of k, A[2] / A[3] of the second; B[0] / B[1] the two halves
+ * of k of the first n8 tile, B[2] / B[3] of the second.
+ *  - int8 (m16n8k32 = four m8n8k16): the integer sums are exact, so the results are the sm_80 wrappers' bit for bit;
+ *  - fp16 (m16n8k16 = two m16n8k8): the accumulator is rounded after every 8 products instead of every 16.
+ */
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate, bool kUnsignedA = false>
+__device__ __forceinline__ void mma_sync_m8n8k16_row_col_x8s8s32(int32_t* C, const uint32_t A, const uint32_t B) {
+#ifdef MMA_S8S8S32_M8N8K16_ENABLED
+  if constexpr (kUnsignedA)
+  {
+    if constexpr (mma_mode == MMAMode::kInplaceUpdate)
+    {
+      asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.u8.s8.s32 {%0, %1}, {%2}, {%3}, {%4, %5};\n"
+                   : "=r"(C[0]), "=r"(C[1])
+                   : "r"(A), "r"(B), "r"(C[0]), "r"(C[1]));
+    }
+    else
+    {
+      asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.u8.s8.s32 {%0, %1}, {%2}, {%3}, {%4, %5};\n"
+                   : "=r"(C[0]), "=r"(C[1])
+                   : "r"(A), "r"(B), "r"(0), "r"(0));
+    }
+  }
+  else
+  {
+    if constexpr (mma_mode == MMAMode::kInplaceUpdate)
+    {
+      asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%4, %5};\n"
+                   : "=r"(C[0]), "=r"(C[1])
+                   : "r"(A), "r"(B), "r"(C[0]), "r"(C[1]));
+    }
+    else
+    {
+      asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%4, %5};\n"
+                   : "=r"(C[0]), "=r"(C[1])
+                   : "r"(A), "r"(B), "r"(0), "r"(0));
+    }
+  }
+#else
+  RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+#endif
+}
+
+// mma_sync_m16n16k32_row_col_s8s8s32 (kUnsignedA: _u8s8s32) as eight m8n8k16
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate, bool kUnsignedA = false>
+__device__ __forceinline__ void mma_sync_m16n16k32_row_col_x8s8s32_sm75(int32_t* C, uint32_t* A, uint32_t* B) {
+#pragma unroll
+  for (uint32_t n = 0; n < 2; n++)
+  {
+    mma_sync_m8n8k16_row_col_x8s8s32<mma_mode, kUnsignedA>(C + 4 * n, A[0], B[2 * n]);
+    mma_sync_m8n8k16_row_col_x8s8s32<MMAMode::kInplaceUpdate, kUnsignedA>(C + 4 * n, A[2], B[2 * n + 1]);
+    mma_sync_m8n8k16_row_col_x8s8s32<mma_mode, kUnsignedA>(C + 4 * n + 2, A[1], B[2 * n]);
+    mma_sync_m8n8k16_row_col_x8s8s32<MMAMode::kInplaceUpdate, kUnsignedA>(C + 4 * n + 2, A[3], B[2 * n + 1]);
+  }
+}
+
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void mma_sync_m16n8k8_row_col_f16f16f16(uint32_t* C, const uint32_t* A, const uint32_t B) {
+#ifdef MMA_F16F16F16_M16N8K8_ENABLED
+  if constexpr (mma_mode == MMAMode::kInplaceUpdate)
+  {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3}, {%4}, {%5, %6};\n"
+                 : "=r"(C[0]), "=r"(C[1])
+                 : "r"(A[0]), "r"(A[1]), "r"(B), "r"(C[0]), "r"(C[1]));
+  }
+  else
+  {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3}, {%4}, {%5, %6};\n"
+                 : "=r"(C[0]), "=r"(C[1])
+                 : "r"(A[0]), "r"(A[1]), "r"(B), "r"(0), "r"(0));
+  }
+#else
+  RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+#endif
+}
+
+// mma_sync_m16n16k16_row_col_f16f16f16 as four m16n8k8 (A[0], A[1] then A[2], A[3] into each n8 half)
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f16_sm75(uint32_t* C, uint32_t* A, uint32_t* B) {
+#pragma unroll
+  for (uint32_t n = 0; n < 2; n++)
+  {
+    mma_sync_m16n8k8_row_col_f16f16f16<mma_mode>(C + 2 * n, A, B[2 * n]);
+    mma_sync_m16n8k8_row_col_f16f16f16<MMAMode::kInplaceUpdate>(C + 2 * n, A + 2, B[2 * n + 1]);
+  }
+}
+
+// rowsum_f16f16f32 as two m16n8k8: d[0] += the sum of row g's 16 values of s, d[1] of row g + 8's (fp32 accumulator)
+__device__ __forceinline__ void rowsum_f16f16f32_sm75(float* d, uint32_t* s) {
+#ifdef MMA_F16F16F32_M16N8K8_ENABLED
+#pragma unroll
+  for (uint32_t h = 0; h < 2; h++)
+  {
+    asm volatile(
+        "{\n"
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,  _,  %1,  _},"
+        "{%2,  %3},"
+        "{%4},"
+        "{%5,  0.,  %6,  0.};\n"
+        "}\n"
+        : "=f"(d[0]), "=f"(d[1])
+        : "r"(s[2 * h]), "r"(s[2 * h + 1]), "r"(1006648320), // two 1.0 in half precision
+          "f"(d[0]), "f"(d[1]));
+  }
 #else
   RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
 #endif

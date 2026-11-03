@@ -26,6 +26,13 @@ from .triton.attn_qk_int8_per_block_causal_varlen import forward as attn_true_va
 
 from .triton.quant_per_thread import per_thread_int8 as per_thread_int8_triton
 
+# Spellcast3D round L: the Turing (sm_75) build of the flows' kernel (torch.ops.sageattention_qattn_sm75)
+try:
+    from . import _qattn_sm75
+    SM75_ENABLED = True
+except:
+    SM75_ENABLED = False
+
 try:
     from . import _qattn_sm80
     SM80_ENABLED = True
