@@ -70,6 +70,12 @@
 #ifndef SC3D_SV_ORDER
 #define SC3D_SV_ORDER 1
 #endif
+// study knob (0 in the package): the tuned kernel's S accumulators started from the bits of 1.5 * 2^23 and read by
+// one FADD (attn_utils.cuh, SC3D_MAGIC_I) instead of an I2F - the same floats; as sm_86 SASS on an RTX 3060 within
+// noise of the I2F (Spellcast3D round N: -1.0 / +0.0 / -0.4 % a call at 8,192 / 21,504 / 41,637 tokens)
+#ifndef SC3D_PRESET_S_F16
+#define SC3D_PRESET_S_F16 0
+#endif
 
 template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN, QuantGranularity K_GRAN,
         typename DTypeSVAccum, bool use_inst_buffer, typename DTypeOut, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode, bool return_lse, bool fuse_v_mean, bool sc3d>
@@ -141,6 +147,16 @@ __device__ __forceinline__ void sc3d_sv_fv(const smem_t<swizzle_mode, stride> &s
     }
   }
 }
+
+// S as floats: from the preset accumulators by one FADD (kPreset), else by I2F, the shipped code
+template <bool kPreset>
+__device__ __forceinline__ float sc3d_s_float(const int32_t x)
+{
+  if constexpr (kPreset)
+    return __int_as_float(x) - SC3D_MAGIC_F;
+  else
+    return __int2float_rz(x);
+}
 // ---- end of the Spellcast3D round J helpers
 
 template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN, QuantGranularity K_GRAN,
@@ -174,6 +190,7 @@ __global__ void __launch_bounds__(SC3D_TUNED::max_threads, SC3D_TUNED::min_block
   constexpr uint32_t num_tiles_k = WARP_K / MMA_QK_N;
   constexpr uint32_t num_tiles_qk_inner = (DTypeQK == DataType::kInt8) ? (head_dim / MMA_QK_K) : (head_dim / 2 / MMA_QK_K);
   constexpr uint32_t num_tiles_v = head_dim / MMA_SV_N;
+  constexpr bool SC3D_PRESET = SC3D_TUNED::value && SC3D_PRESET_S_F16 > 0;   // S from preset accumulators
 
   constexpr uint32_t QK_SMEM_STRIDE = (DTypeQK == DataType::kInt8) ? (head_dim) : (head_dim / 2);
   constexpr uint32_t O_SMEM_STRIDE = head_dim;
@@ -377,7 +394,7 @@ __global__ void __launch_bounds__(SC3D_TUNED::max_threads, SC3D_TUNED::min_block
     }
     else
     {
-      compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
+      compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK, SC3D_PRESET>(
         smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
     }
 
@@ -392,7 +409,7 @@ __global__ void __launch_bounds__(SC3D_TUNED::max_threads, SC3D_TUNED::min_block
 #pragma unroll
         for (uint32_t k = 0; k < 8; k++)
         {
-          RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
+          RS_f32[fq][fk][k] = sc3d_s_float<SC3D_PRESET>(RS[fq][fk][k]);
         }
       }
     }
@@ -479,7 +496,7 @@ __global__ void __launch_bounds__(SC3D_TUNED::max_threads, SC3D_TUNED::min_block
     }
     else
     {
-      compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
+      compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK, SC3D_PRESET>(
         smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
     }
 
@@ -494,7 +511,7 @@ __global__ void __launch_bounds__(SC3D_TUNED::max_threads, SC3D_TUNED::min_block
 #pragma unroll
         for (uint32_t k = 0; k < 8; k++)
         {
-          RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]) * dequant_scale;
+          RS_f32[fq][fk][k] = sc3d_s_float<SC3D_PRESET>(RS[fq][fk][k]) * dequant_scale;
         }
       }
     }
@@ -584,7 +601,7 @@ __global__ void __launch_bounds__(SC3D_TUNED::max_threads, SC3D_TUNED::min_block
     }
     else
     {
-      compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
+      compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK, SC3D_PRESET>(
         smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
     }
 
@@ -599,7 +616,7 @@ __global__ void __launch_bounds__(SC3D_TUNED::max_threads, SC3D_TUNED::min_block
 #pragma unroll
         for (uint32_t k = 0; k < 8; k++)
         {
-            RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]) * dequant_scale;
+            RS_f32[fq][fk][k] = sc3d_s_float<SC3D_PRESET>(RS[fq][fk][k]) * dequant_scale;
         }
       }
     }
@@ -795,6 +812,9 @@ __global__ void __launch_bounds__(SC3D_TUNED::max_threads, SC3D_TUNED::min_block
 
   // }
 }
+
+// SC3D_F16_KERNEL_ONLY (Spellcast3D): the kernel template above without the ops below, for a standalone study build
+#ifndef SC3D_F16_KERNEL_ONLY
 
 // tensor_layout 0 for [B, N, H, D], 1 for [B, H, N, D]
 torch::Tensor qk_int8_sv_f16_accum_f32_attn(torch::Tensor query,
@@ -1542,3 +1562,5 @@ torch::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(torch::Tensor query,
 
   return lse;
 }
+
+#endif // SC3D_F16_KERNEL_ONLY

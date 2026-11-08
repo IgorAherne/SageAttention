@@ -48,6 +48,16 @@
 #ifndef I8_STUDY
 #define I8_STUDY 0
 #endif
+// study knobs (0 in the package): the int32 accumulators of S / of the P.V products started from the bits of
+// 1.5 * 2^23 and read by one FADD (attn_utils.cuh, SC3D_MAGIC_I) instead of an I2F - the same answers bit for bit,
+// and slower as sm_86 SASS on an RTX 3060 (Spellcast3D round N: S and P.V +2.6 % a call at 21,504 tokens, S alone
+// +0.3 %, P.V alone +1.2 %; the I2FP of sm_86 / sm_89 is no bottleneck here, and the preset costs registers)
+#ifndef SC3D_PRESET_S
+#define SC3D_PRESET_S 0
+#endif
+#ifndef SC3D_PRESET_PV
+#define SC3D_PRESET_PV 0
+#endif
 
 namespace sc3d_i8 {
 
@@ -146,6 +156,16 @@ __device__ __forceinline__ void pack_p(float RS[][TILES_K][8], uint32_t RP[2][4]
 // attention kernel and op - the softmax helpers above and v's quantiser below, for another architecture
 #ifndef SC3D_I8_QUANT_ONLY
 
+// an int32 product sum of the P.V as a float: from the preset accumulator by one FADD, else by I2F
+__device__ __forceinline__ float pv_float(const int32_t x)
+{
+#if SC3D_PRESET_PV
+  return __int_as_float(x) - SC3D_MAGIC_F;
+#else
+  return __int2float_rn(x);
+#endif
+}
+
 // P.V of one block: per 16-channel tile, the int32 product over the 64 keys (V^T fragments by ldmatrix, two
 // m16n16k32 u8 x s8), then RO = product * (pmax / 255) * v_scale + RO (* o_scale with kRescale) per row and channel
 template <bool kRescale>
@@ -168,7 +188,14 @@ __device__ __forceinline__ void compute_sv_t(const smem_t<SwizzleMode::k64B, 4> 
     uint32_t RV[4];
     // rows: channels fv * 16 + (lane % 8) + 8 * (lane / 16), 16-byte units: keys 0-15 / 16-31 (+ 32 for the second step)
     smem_V.ldmatrix_m8n8x4(offset_V0 + fv * 16 * 4, RV);
+#if SC3D_PRESET_PV
+#pragma unroll
+    for (uint32_t i = 0; i < 8; i++)
+      acc[i] = SC3D_MAGIC_I;
+    mma::mma_sync_m16n16k32_row_col_u8s8s32<mma::MMAMode::kInplaceUpdate>(acc, RP[0], RV);
+#else
     mma::mma_sync_m16n16k32_row_col_u8s8s32<mma::MMAMode::kInit>(acc, RP[0], RV);
+#endif
     smem_V.ldmatrix_m8n8x4(offset_V1 + fv * 16 * 4, RV);
     mma::mma_sync_m16n16k32_row_col_u8s8s32<mma::MMAMode::kInplaceUpdate>(acc, RP[1], RV);
 #endif
@@ -180,14 +207,14 @@ __device__ __forceinline__ void compute_sv_t(const smem_t<SwizzleMode::k64B, 4> 
     // accumulator elements 0, 1 / 4, 5: row g, channels fv * 16 + 2 (lane % 4) + 0, 1 / + 8; 2, 3 / 6, 7: row g + 8
     const float2 sa = *(const float2*)(vs + fv * 16);
     const float2 sb = *(const float2*)(vs + fv * 16 + 8);
-    RO[0][fv][0] = fmaf(__int2float_rn(acc[0]), f0 * sa.x, kRescale ? RO[0][fv][0] * o_scale[0] : RO[0][fv][0]);
-    RO[0][fv][1] = fmaf(__int2float_rn(acc[1]), f0 * sa.y, kRescale ? RO[0][fv][1] * o_scale[0] : RO[0][fv][1]);
-    RO[0][fv][2] = fmaf(__int2float_rn(acc[2]), f1 * sa.x, kRescale ? RO[0][fv][2] * o_scale[1] : RO[0][fv][2]);
-    RO[0][fv][3] = fmaf(__int2float_rn(acc[3]), f1 * sa.y, kRescale ? RO[0][fv][3] * o_scale[1] : RO[0][fv][3]);
-    RO[0][fv][4] = fmaf(__int2float_rn(acc[4]), f0 * sb.x, kRescale ? RO[0][fv][4] * o_scale[0] : RO[0][fv][4]);
-    RO[0][fv][5] = fmaf(__int2float_rn(acc[5]), f0 * sb.y, kRescale ? RO[0][fv][5] * o_scale[0] : RO[0][fv][5]);
-    RO[0][fv][6] = fmaf(__int2float_rn(acc[6]), f1 * sb.x, kRescale ? RO[0][fv][6] * o_scale[1] : RO[0][fv][6]);
-    RO[0][fv][7] = fmaf(__int2float_rn(acc[7]), f1 * sb.y, kRescale ? RO[0][fv][7] * o_scale[1] : RO[0][fv][7]);
+    RO[0][fv][0] = fmaf(pv_float(acc[0]), f0 * sa.x, kRescale ? RO[0][fv][0] * o_scale[0] : RO[0][fv][0]);
+    RO[0][fv][1] = fmaf(pv_float(acc[1]), f0 * sa.y, kRescale ? RO[0][fv][1] * o_scale[0] : RO[0][fv][1]);
+    RO[0][fv][2] = fmaf(pv_float(acc[2]), f1 * sa.x, kRescale ? RO[0][fv][2] * o_scale[1] : RO[0][fv][2]);
+    RO[0][fv][3] = fmaf(pv_float(acc[3]), f1 * sa.y, kRescale ? RO[0][fv][3] * o_scale[1] : RO[0][fv][3]);
+    RO[0][fv][4] = fmaf(pv_float(acc[4]), f0 * sb.x, kRescale ? RO[0][fv][4] * o_scale[0] : RO[0][fv][4]);
+    RO[0][fv][5] = fmaf(pv_float(acc[5]), f0 * sb.y, kRescale ? RO[0][fv][5] * o_scale[0] : RO[0][fv][5]);
+    RO[0][fv][6] = fmaf(pv_float(acc[6]), f1 * sb.x, kRescale ? RO[0][fv][6] * o_scale[1] : RO[0][fv][6]);
+    RO[0][fv][7] = fmaf(pv_float(acc[7]), f1 * sb.y, kRescale ? RO[0][fv][7] * o_scale[1] : RO[0][fv][7]);
 #endif
   }
 }
@@ -312,15 +339,15 @@ __global__ void __launch_bounds__(THREADS, 2) qk_int_sv_i8_attn_kernel(int8_t *_
   {                                                                                                                      \
     const float dequant_w = q_scale * K_scale[k_scale_idx + (W)];                                                        \
     uint32_t k_mma = K_smem_offset_mma + ((W) & 1) * K_BUF_UNITS;                                                        \
-    compute_int_qk<NUM_WARPS, 1, 1, TILES_K, TILES_QK_INNER, SwizzleMode::k128B, HEAD / 16, DataType::kInt8>(           \
-      smem_Q, smem_K, RS, Q_smem_offset_mma, k_mma);                                                                     \
+    compute_int_qk<NUM_WARPS, 1, 1, TILES_K, TILES_QK_INNER, SwizzleMode::k128B, HEAD / 16, DataType::kInt8,             \
+                   (bool)SC3D_PRESET_S>(smem_Q, smem_K, RS, Q_smem_offset_mma, k_mma);                                   \
     float RS_f32[1][TILES_K][8];                                                                                         \
     _Pragma("unroll")                                                                                                    \
     for (uint32_t fk = 0; fk < TILES_K; fk++)                                                                            \
     {                                                                                                                    \
       _Pragma("unroll")                                                                                                  \
       for (uint32_t k = 0; k < 8; k++)                                                                                   \
-        RS_f32[0][fk][k] = __int2float_rz(RS[0][fk][k]);                                                                 \
+        RS_f32[0][fk][k] = SC3D_PRESET_S ? __int_as_float(RS[0][fk][k]) - SC3D_MAGIC_F : __int2float_rz(RS[0][fk][k]);   \
     }                                                                                                                    \
     float scale_w;                                                                                                       \
     if ((W) + 2 < num_iterations)                                                                                        \

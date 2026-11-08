@@ -169,9 +169,17 @@ __device__ __forceinline__ void load_fp8_V_global_to_share(int8_t **lane_ptr, ui
   *lane_ptr -= (smem_iters_col * global_to_shared_copy_lines_per_warp_per_iter) * gmem_stride;
 }
 
-template <uint32_t num_warps_q, uint32_t num_warps_k, 
-          uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_qk_inner, 
-          SwizzleMode swizzle_mode, uint32_t stride, DataType DTypeQK>
+// Spellcast3D: an int32 accumulator started from the bits of 1.5 * 2^23 (SC3D_MAGIC_I) holds 1.5 * 2^23 + s as a
+// float while |s| < 2^22, so __int_as_float(acc) - SC3D_MAGIC_F is s exactly: one FADD instead of an I2F. Every int8
+// product sum of these kernels is below 2^22 in magnitude (S: 128 channels x 128 x 128 = 2^21; an int8 P.V block:
+// 64 keys x 255 x 128 < 2^21), so the floats are those of __int2float_rz / __int2float_rn bit for bit.
+constexpr int32_t SC3D_MAGIC_I = 0x4B400000;
+constexpr float SC3D_MAGIC_F = 12582912.0f;
+
+// kPreset (Spellcast3D): RS starts from SC3D_MAGIC_I instead of zero (read it with __int_as_float(RS) - SC3D_MAGIC_F)
+template <uint32_t num_warps_q, uint32_t num_warps_k,
+          uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_qk_inner,
+          SwizzleMode swizzle_mode, uint32_t stride, DataType DTypeQK, bool kPreset = false>
 __device__ __forceinline__ void compute_int_qk(const smem_t<swizzle_mode, stride> &smem_Q, const smem_t<swizzle_mode, stride> &smem_K, int32_t RS[][num_tiles_k][8], uint32_t &offset_Q, uint32_t &offset_K)
 {
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4);
@@ -179,7 +187,22 @@ __device__ __forceinline__ void compute_int_qk(const smem_t<swizzle_mode, stride
   uint32_t RQ[num_tiles_q][4];
   uint32_t RK[4];
 
-  // the first iteration, mma mode is kInit
+  if constexpr (kPreset)
+  {
+#pragma unroll
+    for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+    {
+#pragma unroll
+      for (uint32_t fk = 0; fk < num_tiles_k; fk++)
+      {
+#pragma unroll
+        for (uint32_t k = 0; k < 8; k++)
+          RS[fq][fk][k] = SC3D_MAGIC_I;
+      }
+    }
+  }
+
+  // the first iteration, mma mode is kInit (kInplaceUpdate on the preset accumulators)
 #pragma unroll
   for (uint32_t iter = 0; iter < 1; iter++)
   {
@@ -206,11 +229,11 @@ __device__ __forceinline__ void compute_int_qk(const smem_t<swizzle_mode, stride
       {
         if constexpr (DTypeQK == DataType::kInt8)
         {
-          mma::mma_sync_m16n16k32_row_col_s8s8s32<mma::MMAMode::kInit>(RS[fq][fk], RQ[fq], RK);
+          mma::mma_sync_m16n16k32_row_col_s8s8s32<kPreset ? mma::MMAMode::kInplaceUpdate : mma::MMAMode::kInit>(RS[fq][fk], RQ[fq], RK);
         }
         else if constexpr (DTypeQK == DataType::kInt4)
         {
-          mma::mma_sync_m16n16k64_row_col_s4s4s32<mma::MMAMode::kInit>(RS[fq][fk], RQ[fq], RK);
+          mma::mma_sync_m16n16k64_row_col_s4s4s32<kPreset ? mma::MMAMode::kInplaceUpdate : mma::MMAMode::kInit>(RS[fq][fk], RQ[fq], RK);
         }
       }
     }
