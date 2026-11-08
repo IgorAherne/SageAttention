@@ -18,6 +18,7 @@
 #include <torch/library.h>
 
 #include "attn_cuda_sm61.h"
+#include "attn_cuda_sm61_variants.h"
 
 extern "C" {
     /* Creates a dummy empty _C module that can be imported from Python.
@@ -91,6 +92,17 @@ TORCH_LIBRARY(sageattention_qattn_sm61, m) {
             "float sm_scale, "
             "int pv_int8"
           ") -> ()");
+    // Spellcast3D round O: sageattn_pascal's twins (attn_cuda_sm61_variants.h), its arguments and its bits
+#define SC3D_P61_TWIN_SCHEMA(name) m.def(name "(Tensor query, Tensor key, Tensor value, Tensor(a!) output, int tensor_layout, float sm_scale, int pv_int8) -> ()")
+    SC3D_P61_TWIN_SCHEMA("sageattn_pascal_u28");
+    SC3D_P61_TWIN_SCHEMA("sageattn_pascal_u44");
+    SC3D_P61_TWIN_SCHEMA("sageattn_pascal_s28");
+    SC3D_P61_TWIN_SCHEMA("sageattn_pascal_s24");
+#ifdef SC3D_P61_DEV_VARIANTS
+    SC3D_P61_TWIN_SCHEMA("sageattn_pascal_u24");
+    SC3D_P61_TWIN_SCHEMA("sageattn_pascal_s");
+    SC3D_P61_TWIN_SCHEMA("sageattn_pascal_n0");
+#endif
 }
 
 // Registers CUDA implementations
@@ -100,4 +112,13 @@ TORCH_LIBRARY_IMPL(sageattention_qattn_sm61, CUDA, m) {
     m.impl("qk_int8_sv_f32_attn_pascal", &qk_int8_sv_f32_attn_pascal);
     m.impl("qk_int8_sv_i8_attn_pascal", &qk_int8_sv_i8_attn_pascal);
     m.impl("sageattn_pascal", &sageattn_pascal);
+    m.impl("sageattn_pascal_u28", &sageattn_pascal_u28);
+    m.impl("sageattn_pascal_u44", &sageattn_pascal_u44);
+    m.impl("sageattn_pascal_s28", &sageattn_pascal_s28);
+    m.impl("sageattn_pascal_s24", &sageattn_pascal_s24);
+#ifdef SC3D_P61_DEV_VARIANTS
+    m.impl("sageattn_pascal_u24", &sageattn_pascal_u24);
+    m.impl("sageattn_pascal_s", &sageattn_pascal_s);
+    m.impl("sageattn_pascal_n0", &sageattn_pascal_n0);
+#endif
 }

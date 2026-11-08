@@ -169,6 +169,11 @@ if has_capability(("6.1",)):
         sources=[
             "csrc/qattn/pybind_sm61.cpp",
             "csrc/qattn/pascal/qattn_pascal.cu",
+            # Spellcast3D round O: sageattn_pascal's twins (the same bits, other code shapes; raced at install)
+            "csrc/qattn/pascal/variants/p61_u28.cu",
+            "csrc/qattn/pascal/variants/p61_u44.cu",
+            "csrc/qattn/pascal/variants/p61_s28.cu",
+            "csrc/qattn/pascal/variants/p61_s24.cu",
         ],
         extra_compile_args={
             "cxx": CXX_FLAGS,
