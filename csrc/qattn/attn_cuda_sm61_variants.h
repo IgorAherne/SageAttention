@@ -15,6 +15,7 @@ SC3D_P61_DECLARE(sageattn_pascal_u28)   // the score loop unrolled by 2 (main lo
 SC3D_P61_DECLARE(sageattn_pascal_u44)   // the P.V loop unrolled by 4 (7.2 KB)
 SC3D_P61_DECLARE(sageattn_pascal_s28)   // the P.V by channel slices, the score loop unrolled by 2 (7.5 KB)
 SC3D_P61_DECLARE(sageattn_pascal_s24)   // the P.V by channel slices, score loop 2, P.V 4 (6.5 KB)
+SC3D_P61_DECLARE(sageattn_pascal_k64)   // round P: 64 keys an iteration as two 32-key blocks, one score loop (int8 P.V)
 #ifdef SC3D_P61_DEV_VARIANTS
 // developers only (code/devtools/pixal3d-lowmem/round-o/pascal-kernels: the exactness proof covers them too)
 SC3D_P61_DECLARE(sageattn_pascal_u24)   // score loop 2, P.V 4 (6.3 KB)

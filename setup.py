@@ -174,6 +174,8 @@ if has_capability(("6.1",)):
             "csrc/qattn/pascal/variants/p61_u44.cu",
             "csrc/qattn/pascal/variants/p61_s28.cu",
             "csrc/qattn/pascal/variants/p61_s24.cu",
+            # Spellcast3D round P: 64 keys an iteration, one score loop for two 32-key blocks (the same bits)
+            "csrc/qattn/pascal/variants/p61_k64.cu",
         ],
         extra_compile_args={
             "cxx": CXX_FLAGS,
