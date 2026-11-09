@@ -67,7 +67,7 @@
 #define SC3D_P61_STUDY 0
 #endif
 // Spellcast3D round P (pascal-attn): exact reschedules of the int8 P.V kernel (the fp32 P.V kernel stays the shipped
-// one in every variant of this file). Each output is still one lane's fma chain over the keys in the shipped order
+// kernel's code in every variant of this file; a variant's SC3D_P61_QK_UNROLL applies to it too). Each output is still one lane's fma chain over the keys in the shipped order
 // with the shipped factors, the integer sums the same sums, the softmax the same operations on the same values: the
 // shipped kernel's bits.
 //  SC3D_P61_I8_WARPS  warps a block of the int8 P.V kernel (8 shipped: 64 queries, 2 blocks an SM; 4: 32 queries, 4
