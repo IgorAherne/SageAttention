@@ -99,6 +99,7 @@ TORCH_LIBRARY(sageattention_qattn_sm61, m) {
     SC3D_P61_TWIN_SCHEMA("sageattn_pascal_s28");
     SC3D_P61_TWIN_SCHEMA("sageattn_pascal_s24");
     SC3D_P61_TWIN_SCHEMA("sageattn_pascal_k64");   // Spellcast3D round P
+    SC3D_P61_TWIN_SCHEMA("sageattn_pascal_px");    // Spellcast3D round P sage-bias: the precise Q.K^T (other bits)
 #ifdef SC3D_P61_DEV_VARIANTS
     SC3D_P61_TWIN_SCHEMA("sageattn_pascal_u24");
     SC3D_P61_TWIN_SCHEMA("sageattn_pascal_s");
@@ -118,6 +119,7 @@ TORCH_LIBRARY_IMPL(sageattention_qattn_sm61, CUDA, m) {
     m.impl("sageattn_pascal_s28", &sageattn_pascal_s28);
     m.impl("sageattn_pascal_s24", &sageattn_pascal_s24);
     m.impl("sageattn_pascal_k64", &sageattn_pascal_k64);
+    m.impl("sageattn_pascal_px", &sageattn_pascal_px);
 #ifdef SC3D_P61_DEV_VARIANTS
     m.impl("sageattn_pascal_u24", &sageattn_pascal_u24);
     m.impl("sageattn_pascal_s", &sageattn_pascal_s);

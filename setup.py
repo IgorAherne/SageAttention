@@ -176,6 +176,8 @@ if has_capability(("6.1",)):
             "csrc/qattn/pascal/variants/p61_s24.cu",
             # Spellcast3D round P: 64 keys an iteration, one score loop for two 32-key blocks (the same bits)
             "csrc/qattn/pascal/variants/p61_k64.cu",
+            # Spellcast3D round P sage-bias: the precise Q.K^T (sageattn_pascal_px; other bits by design)
+            "csrc/qattn/pascal/variants/p61_px.cu",
         ],
         extra_compile_args={
             "cxx": CXX_FLAGS,

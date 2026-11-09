@@ -16,6 +16,10 @@ SC3D_P61_DECLARE(sageattn_pascal_u44)   // the P.V loop unrolled by 4 (7.2 KB)
 SC3D_P61_DECLARE(sageattn_pascal_s28)   // the P.V by channel slices, the score loop unrolled by 2 (7.5 KB)
 SC3D_P61_DECLARE(sageattn_pascal_s24)   // the P.V by channel slices, score loop 2, P.V 4 (6.5 KB)
 SC3D_P61_DECLARE(sageattn_pascal_k64)   // round P: 64 keys an iteration as two 32-key blocks, one score loop (int8 P.V)
+// Round P sage-bias: NOT a twin - a more exact Q.K^T (q and k minus their means over the tokens, one scale per token,
+// q's mean times k added back exactly) on k64's schedule: other bits by design, accepted by the fork's calibration on
+// its accuracy against the shipped op on the user's card (sage.py: PASCAL_PRECISE)
+SC3D_P61_DECLARE(sageattn_pascal_px)
 #ifdef SC3D_P61_DEV_VARIANTS
 // developers only (code/devtools/pixal3d-lowmem/round-o/pascal-kernels: the exactness proof covers them too)
 SC3D_P61_DECLARE(sageattn_pascal_u24)   // score loop 2, P.V 4 (6.3 KB)

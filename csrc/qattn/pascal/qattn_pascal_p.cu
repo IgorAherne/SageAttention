@@ -95,6 +95,19 @@
 #ifndef SC3D_P61_F32_ONLY
 #define SC3D_P61_F32_ONLY 0
 #endif
+// Spellcast3D round P (sage-bias): SC3D_P61_PRECISE 1 = a more exact Q.K^T, NOT the shipped bits (a precision change):
+//  - q's mean over the tokens (per head and channel) subtracted before its quantisation, and its products with k (k
+//    minus k's mean, exact fp32) added back per key as a bias of the scores - the scores lose the part of q's error
+//    that the shared mean carried;
+//  - one q scale per token and one k scale per token (absmax / 127 of the token's 128 channels) instead of one per 16
+//    q tokens and one per 64 k tokens.
+// On the flows' captured operands the relative L2 error of the attention against fp32 drops by ~30 % (round P's
+// bias.py emulation, which reproduces the shipped kernel to 1e-7). The scores of a lane: x = (I - M) * (q_scale *
+// k_scale) + bias, the k scales and biases of an iteration's keys staged with its K tile (float2 [keys]). The P.V
+// (fp32 and int8) is the shipped one. Only the all-in-one op (sageattn_pascal_<V>) serves such a build.
+#ifndef SC3D_P61_PRECISE
+#define SC3D_P61_PRECISE 0
+#endif
 
 namespace sc3d_p61 {
 
@@ -321,6 +334,67 @@ __global__ void __launch_bounds__(128) quant_int8_kernel(const T *__restrict__ x
   }
 }
 
+#if SC3D_P61_PRECISE
+// ---- round P (SC3D_P61_PRECISE): q or k to int8 with one scale per token, 64 tokens of one head a block of 4 warps (a
+// warp 16 tokens, a lane 4 channels of each), x minus its mean over the tokens (`mean`). q (kKey false): the scale
+// into scale[bh * npad + token]. k (kKey true): (scale, bias) into kb[bh * npad + token] (float2), the bias the
+// exact product of q's mean (`qmean`) with the token's k minus k's mean, times the softmax scale in log2 units. The
+// pad tokens past n become zeros (scale ~1e-7 / 127, bias 0).
+__device__ __forceinline__ float warp_sum(float x)
+{
+#pragma unroll
+  for (int o = 16; o > 0; o /= 2)
+    x += __shfl_xor_sync(0xffffffff, x, o);
+  return x;
+}
+
+template <typename T, bool kKey>
+__global__ void __launch_bounds__(128) quant_tok_kernel(const T *__restrict__ x, const float *__restrict__ mean,
+                                                        const float *__restrict__ qmean, int8_t *__restrict__ out,
+                                                        float *__restrict__ scale, float2 *__restrict__ kb,
+                                                        const float sm_scale_log2, const int n, const int npad,
+                                                        const int64_t stride_bz, const int64_t stride_seq, const int64_t stride_h)
+{
+  const int lane = threadIdx.x % 32, w = threadIdx.x / 32;
+  const int tile = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
+  const int64_t bh = (int64_t)b * gridDim.y + h;
+  const T *xp = x + b * stride_bz + h * stride_h + 4 * lane;
+  const float4 mu = *reinterpret_cast<const float4*>(mean + bh * HEAD + 4 * lane);
+  float4 qm = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  if constexpr (kKey)
+    qm = *reinterpret_cast<const float4*>(qmean + bh * HEAD + 4 * lane);
+  const int row0 = tile * 64 + 16 * w;
+  int8_t *op = out + (bh * npad + row0) * HEAD + 4 * lane;
+#pragma unroll 4
+  for (int r = 0; r < 16; r++)
+  {
+    float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (row0 + r < n)
+    {
+      const float4 t = load4(xp + (row0 + r) * stride_seq);
+      v = make_float4(t.x - mu.x, t.y - mu.y, t.z - mu.z, t.w - mu.w);
+    }
+    float amax = fmaxf(0.0000001f, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+    amax = warp_max(amax);
+    const float inv = __fdiv_rn(127.0f, amax);
+    *reinterpret_cast<int*>(op + r * HEAD) = pack_s8x4(v.x * inv, v.y * inv, v.z * inv, v.w * inv);
+    const float s = __fdiv_rn(amax, 127.0f);
+    if constexpr (kKey)
+    {
+      float d = fmaf(qm.x, v.x, fmaf(qm.y, v.y, fmaf(qm.z, v.z, qm.w * v.w)));
+      d = warp_sum(d);
+      if (lane == 0)
+        kb[bh * npad + row0 + r] = make_float2(s, row0 + r < n ? d * sm_scale_log2 : 0.0f);
+    }
+    else
+    {
+      if (lane == 0)
+        scale[bh * npad + row0 + r] = s;
+    }
+  }
+}
+#endif
+
 // ---- v to int8 for the int8 P.V: one 32-key block of one head a block of 8 warps (warp w the keys 4w .. 4w + 3, a lane
 // 4 channels); v minus its channel mean, one scale per channel (absmax / 127; 1 where the absmax is 0), the codes
 // rint(x / scale); stored as words of 4 keys of one channel
@@ -424,8 +498,19 @@ __global__ void __launch_bounds__(Cfg<kInt8PV>::T, Cfg<kInt8PV>::MINB) qk_int8_a
     const int row = i / (HEAD / 16), seg = i % (HEAD / 16);
     *reinterpret_cast<int4*>(&Q8s[row * QKS + seg * 4]) = *reinterpret_cast<const int4*>(&Q8h[row * (HEAD / 4) + seg * 4]);
   }
+#if SC3D_P61_PRECISE
+  // round P precise: one q scale per query (jc's and jo's), the k scales and score biases of the iteration's keys in
+  // shared memory (K_scale is the quantiser's float2 [B, H, Npad] then), staged with the K tile
+  static_assert(!C::DB, "the precise scores stage their k scales with the single-buffered K tile");
+  const float qsc = Q_scale[bh * nq_pad + q0 + jc] * sm_scale_log2;
+  const float qso = Q_scale[bh * nq_pad + q0 + jo] * sm_scale_log2;
+  const float2 *KBh = reinterpret_cast<const float2*>(K_scale) + bh * nk_pad;
+  __shared__ float2 KBs[BK];
+  float2 kbreg = make_float2(0.0f, 0.0f);
+#else
   // the warp's 8 queries share one q scale (16 tokens); the softmax scale and log2(e) folded in
   const float qs = Q_scale[bh * (nq_pad / WARPQ) + (q0 + 8 * w) / WARPQ] * sm_scale_log2;
+#endif
 
   // P.V: the lane accumulates the warp's 8 queries 8 w + cc, channels 4 lane .. 4 lane + 3
   float acc[8][4];
@@ -460,11 +545,19 @@ __global__ void __launch_bounds__(Cfg<kInt8PV>::T, Cfg<kInt8PV>::MINB) qk_int8_a
 #pragma unroll
     for (int i = 0; i < NP; i++)
       kreg[i] = *reinterpret_cast<const int4*>(&K8h[(int64_t)(k0 + tid / 8 + (NT / 8) * i) * (HEAD / 4) + (tid % 8) * 4]);
+#if SC3D_P61_PRECISE
+    if (tid < BK)
+      kbreg = KBh[k0 + tid];
+#endif
   };
   auto store_K = [&](int *K8s) {
 #pragma unroll
     for (int i = 0; i < NP; i++)
       *reinterpret_cast<int4*>(&K8s[(tid / 8 + (NT / 8) * i) * QKS + (tid % 8) * 4]) = kreg[i];
+#if SC3D_P61_PRECISE
+    if (tid < BK)
+      KBs[tid] = kbreg;
+#endif
   };
   auto load_V = [&](const int k0) {
     if constexpr (kInt8PV)
@@ -542,7 +635,9 @@ __global__ void __launch_bounds__(Cfg<kInt8PV>::T, Cfg<kInt8PV>::MINB) qk_int8_a
 #endif
     }
     const float *Vscs = reinterpret_cast<const float*>(V8s + KW * HEAD);
+#if !SC3D_P61_PRECISE
     const float f = qs * Ksh[k0 / BLKK];
+#endif
 #if SC3D_P61_STUDY & 1
     int so[4], st[4];
 #pragma unroll
@@ -597,6 +692,10 @@ __global__ void __launch_bounds__(Cfg<kInt8PV>::T, Cfg<kInt8PV>::MINB) qk_int8_a
 #if SC3D_P61_STUDY & 256
       xo[j] = __int_as_float(so[j]) * 1e-6f;
       xt[j] = __int_as_float(st[j]) * 1e-6f;
+#elif SC3D_P61_PRECISE
+      const float2 kbj = KBs[8 * j + 4 * hh + g];
+      xo[j] = fmaf(__int_as_float(so[j]) - MAGIC_F, qsc * kbj.x, kbj.y);
+      xt[j] = fmaf(__int_as_float(st[j]) - MAGIC_F, qso * kbj.x, kbj.y);
 #else
       xo[j] = (__int_as_float(so[j]) - MAGIC_F) * f;
       xt[j] = (__int_as_float(st[j]) - MAGIC_F) * f;
@@ -1165,7 +1264,18 @@ __global__ void __launch_bounds__(THREADS, 2) qk_int8_attn_k64_kernel(
     const int row = i / (HEAD / 16), seg = i % (HEAD / 16);
     *reinterpret_cast<int4*>(&Q8s[row * QKS + seg * 4]) = *reinterpret_cast<const int4*>(&Q8h[row * (HEAD / 4) + seg * 4]);
   }
+#if SC3D_P61_PRECISE
+  // round P precise (see qk_int8_attn_kernel); the block's q scales in shared memory, read where the scores are
+  // converted (two registers fewer through the unrolled score loop: no spill at 128)
+  __shared__ float QSs[BQ];
+  if (tid < BQ)
+    QSs[tid] = Q_scale[bh * nq_pad + q0 + tid] * sm_scale_log2;
+  const float2 *KBh = reinterpret_cast<const float2*>(K_scale) + bh * nk_pad;
+  __shared__ float2 KBs[BK2];
+  float2 kbreg = make_float2(0.0f, 0.0f);
+#else
   const float qs = Q_scale[bh * (nq_pad / WARPQ) + (q0 + 8 * w) / WARPQ] * sm_scale_log2;
+#endif
 
   float acc[8][4];
 #pragma unroll
@@ -1188,11 +1298,19 @@ __global__ void __launch_bounds__(THREADS, 2) qk_int8_attn_k64_kernel(
 #pragma unroll
     for (int i = 0; i < 2; i++)
       kreg[i] = *reinterpret_cast<const int4*>(&K8h[(int64_t)(k0 + tid / 8 + 32 * i) * (HEAD / 4) + (tid % 8) * 4]);
+#if SC3D_P61_PRECISE
+    if (tid < BK2)
+      kbreg = KBh[k0 + tid];
+#endif
   };
   auto store_K = [&]() {
 #pragma unroll
     for (int i = 0; i < 2; i++)
       *reinterpret_cast<int4*>(&K8s[(tid / 8 + 32 * i) * QKS + (tid % 8) * 4]) = kreg[i];
+#if SC3D_P61_PRECISE
+    if (tid < BK2)
+      KBs[tid] = kbreg;
+#endif
   };
   auto load_V = [&](const int k0) {       // the blocks k0 / 32 and k0 / 32 + 1 (both inside the padded layout)
     const int blk = k0 / BK;
@@ -1217,8 +1335,14 @@ __global__ void __launch_bounds__(THREADS, 2) qk_int8_attn_k64_kernel(
 #pragma unroll
     for (int j = 0; j < 4; j++)
     {
+#if SC3D_P61_PRECISE
+      const float2 kbj = KBs[s * BK + 8 * j + 4 * hh + g];
+      xo[j] = fmaf(__int_as_float(so[j]) - MAGIC_F, QSs[jc] * kbj.x, kbj.y);
+      xt[j] = fmaf(__int_as_float(st[j]) - MAGIC_F, QSs[jo] * kbj.x, kbj.y);
+#else
       xo[j] = (__int_as_float(so[j]) - MAGIC_F) * f;
       xt[j] = (__int_as_float(st[j]) - MAGIC_F) * f;
+#endif
     }
     if (kb + BK > nk)
     {
@@ -1291,7 +1415,11 @@ __global__ void __launch_bounds__(THREADS, 2) qk_int8_attn_k64_kernel(
     if (k0 + BK2 < nk)
       load_K(k0 + BK2);
     load_V(k0);
+#if SC3D_P61_PRECISE
+    const float f = 0.0f;           // unused: the precise scores take their scales per query and key
+#else
     const float f = qs * Ksh[k0 / BLKK];
+#endif
 
     // the exact scores of blocks A (so, st) and B (su, sv): per chunk the two q rows once, 4 + 4 key rows
     int so[4], st[4], su[4], sv[4];
@@ -1498,6 +1626,22 @@ void quant_int8(const torch::Tensor &x, const Layout &l, const float *mean, torc
   });
 }
 
+#if SC3D_P61_PRECISE
+// round P precise: q (kKey false: one scale per token into `scale`) or k (kKey true: (scale, bias) per token into `kb`)
+template <bool kKey>
+void quant_tok(const torch::Tensor &x, const Layout &l, const float *mean, const float *qmean, torch::Tensor &out,
+               float *scale, float2 *kb, const float sm_scale_log2, cudaStream_t stream)
+{
+  const int npad = pad_tokens(l.n);
+  dispatch_float(x.scalar_type(), [&](auto *tag) {
+    using T = std::remove_pointer_t<decltype(tag)>;
+    quant_tok_kernel<T, kKey><<<dim3(npad / 64, l.h, l.b), 128, 0, stream>>>(
+      reinterpret_cast<const T*>(x.data_ptr()), mean, qmean, out.data_ptr<int8_t>(), scale, kb, sm_scale_log2, l.n,
+      npad, l.stride_bz, l.stride_seq, l.stride_h);
+  });
+}
+#endif
+
 void quant_v(const torch::Tensor &v, const Layout &l, const float *mean, torch::Tensor &out, torch::Tensor &scale, cudaStream_t stream)
 {
   const int npad = pad_tokens(l.n);
@@ -1581,6 +1725,9 @@ void quant_qk_int8_pascal(torch::Tensor query, torch::Tensor key, torch::Tensor 
                           torch::Tensor key_int8, torch::Tensor key_scale, torch::Tensor key_mean,
                           int64_t tensor_layout, int64_t smooth_k)
 {
+#if SC3D_P61_PRECISE
+  TORCH_CHECK(false, "a precise Pascal build (SC3D_P61_PRECISE) serves its all-in-one op alone");
+#endif
   check_input(query, "query");
   check_input(key, "key");
   const Layout lq = layout_of(query, tensor_layout), lk = layout_of(key, tensor_layout);
@@ -1626,6 +1773,9 @@ void quant_v_int8_pascal(torch::Tensor value, torch::Tensor value_int8, torch::T
 void qk_int8_sv_f32_attn_pascal(torch::Tensor query_int8, torch::Tensor key_int8, torch::Tensor value, torch::Tensor output,
                                 torch::Tensor query_scale, torch::Tensor key_scale, int64_t tensor_layout, double sm_scale)
 {
+#if SC3D_P61_PRECISE
+  TORCH_CHECK(false, "a precise Pascal build (SC3D_P61_PRECISE) serves its all-in-one op alone");
+#endif
   check_input(value, "value");
   check_input(output, "output");
   const Layout lv = layout_of(value, tensor_layout), lo = layout_of(output, tensor_layout);
@@ -1641,6 +1791,9 @@ void qk_int8_sv_i8_attn_pascal(torch::Tensor query_int8, torch::Tensor key_int8,
                                torch::Tensor query_scale, torch::Tensor key_scale, torch::Tensor value_scale,
                                torch::Tensor value_mean, int64_t kv_len, int64_t tensor_layout, double sm_scale)
 {
+#if SC3D_P61_PRECISE
+  TORCH_CHECK(false, "a precise Pascal build (SC3D_P61_PRECISE) serves its all-in-one op alone");
+#endif
   check_input(output, "output");
   const Layout lo = layout_of(output, tensor_layout);
   TORCH_CHECK(lo.n > 0 && kv_len > 0, "empty sequence");
@@ -1675,13 +1828,27 @@ void sageattn_pascal(torch::Tensor query, torch::Tensor key, torch::Tensor value
   const auto f32 = query.options().dtype(torch::kFloat32);
   const int nq_pad = pad_tokens(lq.n), nk_pad = pad_tokens(lk.n);
   torch::Tensor q_int8 = torch::empty({lq.b, lq.h, nq_pad, HEAD}, query.options().dtype(torch::kInt8));
-  torch::Tensor q_scale = torch::empty({lq.b, lq.h, nq_pad / WARPQ}, f32);
   torch::Tensor k_int8 = torch::empty({lk.b, lk.h, nk_pad, HEAD}, query.options().dtype(torch::kInt8));
-  torch::Tensor k_scale = torch::empty({lk.b, lk.h, nk_pad / BLKK}, f32);
   torch::Tensor k_mean = torch::empty({lk.b, lk.h, HEAD}, f32);
+#if SC3D_P61_PRECISE
+  // round P precise: q and k each minus its mean over the tokens, one scale per token; k's scales with the scores'
+  // biases (q's mean times k minus its mean, exact) as float2 [B, H, Npad] in k_scale
+  torch::Tensor q_scale = torch::empty({lq.b, lq.h, nq_pad}, f32);
+  torch::Tensor k_scale = torch::empty({lk.b, lk.h, nk_pad, 2}, f32);
+  torch::Tensor q_mean = torch::empty({lq.b, lq.h, HEAD}, f32);
+  channel_mean(query, lq, q_mean, stream);
+  channel_mean(key, lk, k_mean, stream);
+  const float sl2 = (float)sm_scale * LOG2E;
+  quant_tok<false>(query, lq, q_mean.data_ptr<float>(), nullptr, q_int8, q_scale.data_ptr<float>(), nullptr, sl2, stream);
+  quant_tok<true>(key, lk, k_mean.data_ptr<float>(), q_mean.data_ptr<float>(), k_int8, nullptr,
+                  reinterpret_cast<float2*>(k_scale.data_ptr<float>()), sl2, stream);
+#else
+  torch::Tensor q_scale = torch::empty({lq.b, lq.h, nq_pad / WARPQ}, f32);
+  torch::Tensor k_scale = torch::empty({lk.b, lk.h, nk_pad / BLKK}, f32);
   channel_mean(key, lk, k_mean, stream);
   quant_int8<false>(query, lq, nullptr, q_int8, q_scale, stream);
   quant_int8<true>(key, lk, k_mean.data_ptr<float>(), k_int8, k_scale, stream);
+#endif
   if (pv_int8)
   {
     torch::Tensor v_int8 = torch::empty({lv.b, lv.h, nk_pad / 4, HEAD}, query.options().dtype(torch::kInt32));
